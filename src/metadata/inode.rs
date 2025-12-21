@@ -65,6 +65,11 @@ pub struct InodeMetadata {
     /// SHA256 hash of the last checkpointed version (None if never checkpointed)
     pub checkpointed_sha256: Option<[u8; 32]>,
 
+    /// History of SHA256 hashes for this file (most recent first, up to version_count)
+    /// Used to track which versions exist in cold storage for cleanup
+    #[serde(default)]
+    pub sha_history: Vec<[u8; 32]>,
+
     /// Whether local data is present (false if evicted to cloud)
     pub local_data_present: bool,
 
@@ -96,6 +101,7 @@ impl InodeMetadata {
             closed_time: now,
             checkpointed_time: None,
             checkpointed_sha256: None,
+            sha_history: Vec::new(),
             local_data_present: true,
             children: Vec::new(),
             crc: 0,
@@ -120,6 +126,7 @@ impl InodeMetadata {
             closed_time: now,
             checkpointed_time: None,
             checkpointed_sha256: None,
+            sha_history: Vec::new(),
             local_data_present: true,
             children: Vec::new(),
             crc: 0,
@@ -144,6 +151,7 @@ impl InodeMetadata {
             closed_time: now,
             checkpointed_time: None,
             checkpointed_sha256: None,
+            sha_history: Vec::new(),
             local_data_present: true,
             children: Vec::new(),
             crc: 0,
@@ -218,10 +226,15 @@ impl InodeMetadata {
     /// Format: `{sha256[0:2]}/{sha256[0:4]}/{sha256}.{filename}`
     /// Returns None if not checkpointed
     pub fn cloud_key(&self) -> Option<String> {
-        self.checkpointed_sha256.map(|sha256| {
-            let hex = hex::encode(sha256);
-            format!("{}/{}/{}.{}", &hex[0..2], &hex[0..4], hex, self.filename)
-        })
+        self.checkpointed_sha256
+            .map(|sha256| Self::cloud_key_for_sha(sha256, &self.filename))
+    }
+
+    /// Compute cloud storage key for a given SHA256 and filename
+    /// Format: `{sha256[0:2]}/{sha256[0:4]}/{sha256}.{filename}`
+    pub fn cloud_key_for_sha(sha256: [u8; 32], filename: &str) -> String {
+        let hex = hex::encode(sha256);
+        format!("{}/{}/{}.{}", &hex[0..2], &hex[0..4], hex, filename)
     }
 
     /// Convert to fuser FileAttr
@@ -362,6 +375,7 @@ mod proptest_tests {
                 closed_time,
                 checkpointed_time: None,
                 checkpointed_sha256: None,
+                sha_history: Vec::new(),
                 local_data_present: true,
                 children: Vec::new(),
                 crc: 0,

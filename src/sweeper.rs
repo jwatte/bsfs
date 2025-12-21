@@ -7,7 +7,16 @@ use crate::cloud::CloudStorage;
 use crate::config::Config;
 use crate::error::Result;
 use crate::fs::operations;
-use crate::metadata::{Checkpoint, FileType, MetadataLog};
+use crate::metadata::{Checkpoint, FileType, InodeMetadata, MetadataLog};
+
+/// Entry indicating a SHA should be purged from cold storage
+#[derive(Debug, Clone)]
+struct PurgeEntry {
+    /// The cloud storage key to delete
+    key: String,
+    /// Human-readable description for logging
+    description: String,
+}
 
 /// Background task that:
 /// 1. Proactively checkpoints modified files to cloud storage
@@ -62,19 +71,29 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
 
     /// Perform a single sweep cycle:
     /// 1. Checkpoint any modified files to cloud (proactive backup)
-    /// 2. If low on disk space, evict cold files that are safely checkpointed
-    /// 3. Save checkpoint to disk and upload to cloud (only if changes were made)
+    /// 2. Purge old versions from cold storage
+    /// 3. If low on disk space, evict cold files that are safely checkpointed
+    /// 4. Save checkpoint to disk and upload to cloud (only if changes were made)
     async fn sweep(&self) -> Result<()> {
         tracing::debug!("Starting sweep");
 
         let mut checkpoint_changed = false;
+        let mut purge_entries: Vec<PurgeEntry> = Vec::new();
 
         // Phase 1: Checkpoint modified files to cloud (regardless of space pressure)
-        if self.checkpoint_modified_files().await? {
+        let (checkpointed, new_purge_entries) = self.checkpoint_modified_files().await?;
+        if checkpointed {
             checkpoint_changed = true;
         }
+        purge_entries.extend(new_purge_entries);
 
-        // Phase 2: Evict local data only if we're low on space
+        // Phase 2: Purge old versions from cold storage before saving checkpoint
+        // This ensures we don't lose track of what needs to be purged if we crash
+        if !purge_entries.is_empty() {
+            self.purge_old_versions(&purge_entries).await;
+        }
+
+        // Phase 3: Evict local data only if we're low on space
         let free_space = self.get_free_space()?;
         if free_space < self.config.target_free_space {
             tracing::info!(
@@ -89,7 +108,7 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
             tracing::debug!("Sufficient free space: {} bytes", free_space);
         }
 
-        // Phase 3: Save and upload checkpoint only if there were changes
+        // Phase 4: Save and upload checkpoint only if there were changes
         if checkpoint_changed {
             self.save_checkpoint()?;
             self.upload_checkpoint_to_cloud().await?;
@@ -98,13 +117,39 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         Ok(())
     }
 
+    /// Purge old versions from cold storage
+    /// Logs clear messages about what's being purged and any failures
+    async fn purge_old_versions(&self, entries: &[PurgeEntry]) {
+        tracing::info!(
+            "Purging {} old version(s) from cold storage",
+            entries.len()
+        );
+
+        for entry in entries {
+            tracing::info!("Purging from cold storage: {}", entry.description);
+            match self.cloud.delete_by_key(&entry.key).await {
+                Ok(()) => {
+                    tracing::debug!("Successfully purged: {}", entry.key);
+                }
+                Err(e) => {
+                    // Log error but continue with other purges
+                    tracing::error!(
+                        "Failed to purge {} from cold storage: {}",
+                        entry.key,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     /// Upload modified files to cloud storage (proactive checkpointing)
-    /// Returns true if any files were checkpointed
-    async fn checkpoint_modified_files(&self) -> Result<bool> {
+    /// Returns (uploaded_any, purge_entries) - whether any files were uploaded and list of old versions to purge
+    async fn checkpoint_modified_files(&self) -> Result<(bool, Vec<PurgeEntry>)> {
         let files_needing_checkpoint = self.find_files_needing_checkpoint();
 
         if files_needing_checkpoint.is_empty() {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         }
 
         tracing::info!(
@@ -115,12 +160,15 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         let data_root = self.config.data_root();
 
         let mut any_uploaded = false;
+        let mut purge_entries = Vec::new();
+
         for inode in files_needing_checkpoint {
             match self.checkpoint_file_to_cloud(&data_root, inode).await {
-                Ok(uploaded) => {
+                Ok((uploaded, new_purge_entries)) => {
                     if uploaded {
                         any_uploaded = true;
                     }
+                    purge_entries.extend(new_purge_entries);
                 }
                 Err(e) => {
                     tracing::error!("Failed to checkpoint inode {}: {}", inode, e);
@@ -129,7 +177,7 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
             }
         }
 
-        Ok(any_uploaded)
+        Ok((any_uploaded, purge_entries))
     }
 
     /// Find files that have been modified since their last checkpoint
@@ -148,20 +196,21 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
     }
 
     /// Upload a single file to cloud storage
-    /// Returns true if the file was actually uploaded (content changed)
+    /// Returns (uploaded, purge_entries) - whether file was uploaded and any old versions to purge
     async fn checkpoint_file_to_cloud(
         &self,
         data_root: &std::path::Path,
         inode: u64,
-    ) -> Result<bool> {
-        // Get filename and current checkpointed SHA256 from metadata
-        let (filename, current_sha256) = {
+    ) -> Result<(bool, Vec<PurgeEntry>)> {
+        // Get filename, current checkpointed SHA256, and sha_history from metadata
+        let (filename, current_sha256, sha_history) = {
             let cp = self.checkpoint.read().unwrap();
             let meta = cp.get(inode);
             (
                 meta.map(|m| m.filename.clone())
                     .unwrap_or_else(|| format!("{}", inode)),
                 meta.and_then(|m| m.checkpointed_sha256),
+                meta.map(|m| m.sha_history.clone()).unwrap_or_default(),
             )
         };
 
@@ -179,7 +228,25 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
             if let Some(meta) = cp.get_mut(inode) {
                 meta.checkpointed_time = Some(self.clock.as_ref().now());
             }
-            return Ok(false);
+            return Ok((false, Vec::new()));
+        }
+
+        // Check if this SHA256 already exists in history (deduplication)
+        if sha_history.contains(&new_sha256) {
+            tracing::debug!(
+                "Skipping upload for inode {} - SHA256 already in history (deduplicated)",
+                inode
+            );
+            // Update metadata but don't upload
+            let mut cp = self.checkpoint.write().unwrap();
+            if let Some(meta) = cp.get_mut(inode) {
+                meta.checkpointed_time = Some(self.clock.as_ref().now());
+                meta.checkpointed_sha256 = Some(new_sha256);
+                // Move this SHA to the front of history (most recent)
+                meta.sha_history.retain(|&sha| sha != new_sha256);
+                meta.sha_history.insert(0, new_sha256);
+            }
+            return Ok((false, Vec::new()));
         }
 
         tracing::debug!("Uploading inode {} to cloud storage", inode);
@@ -188,16 +255,45 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         let (_version_id, sha256) =
             operations::upload_to_cloud(self.cloud.as_ref(), data_root, inode, &filename).await?;
 
-        // Update in-memory metadata
-        {
+        // Update metadata and determine which old versions to purge
+        let purge_entries = {
             let mut cp = self.checkpoint.write().unwrap();
+            let mut purge_entries = Vec::new();
+
             if let Some(meta) = cp.get_mut(inode) {
                 meta.checkpointed_time = Some(self.clock.as_ref().now());
                 meta.checkpointed_sha256 = Some(sha256);
-            }
-        }
 
-        Ok(true)
+                // Add new SHA to history (at the front, most recent first)
+                meta.sha_history.insert(0, sha256);
+
+                // If history exceeds version_count, remove oldest entries and schedule for purging
+                let version_count = self.config.version_count as usize;
+                while meta.sha_history.len() > version_count {
+                    if let Some(old_sha) = meta.sha_history.pop() {
+                        let key = InodeMetadata::cloud_key_for_sha(old_sha, &meta.filename);
+                        let description = format!(
+                            "inode {} ({}) - old version {}",
+                            inode,
+                            meta.filename,
+                            hex::encode(old_sha)
+                        );
+                        tracing::info!(
+                            "Scheduling purge of old version for inode {} ({}): keeping {} versions, removing SHA {}",
+                            inode,
+                            meta.filename,
+                            version_count,
+                            hex::encode(old_sha)
+                        );
+                        purge_entries.push(PurgeEntry { key, description });
+                    }
+                }
+            }
+
+            purge_entries
+        };
+
+        Ok((true, purge_entries))
     }
 
     /// Evict cold files from local storage to free up disk space
@@ -917,5 +1013,216 @@ mod tests {
 
         let versions_after_third = sweeper.cloud.list_checkpoint_versions().await.unwrap();
         assert_eq!(versions_after_third.len(), 1); // Still just 1!
+    }
+
+    #[tokio::test]
+    async fn test_sha_history_tracking() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let sweeper = create_test_sweeper(dir.path(), &clock);
+
+        // Set high free space (no eviction needed)
+        sweeper.set_free_space_for_test(10_000_000);
+
+        let data_root = sweeper.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+
+        // Add file metadata
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
+        }
+
+        // Write first version and sweep
+        operations::write_local(&data_root, 2, 0, b"version 1").unwrap();
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            if let Some(meta) = cp.get_mut(2) {
+                meta.mutated_time = clock.as_ref().now();
+            }
+        }
+        sweeper.sweep().await.unwrap();
+
+        // Verify sha_history has one entry
+        let sha1 = {
+            let cp = sweeper.checkpoint.read().unwrap();
+            let meta = cp.get(2).unwrap();
+            assert_eq!(meta.sha_history.len(), 1);
+            assert_eq!(meta.checkpointed_sha256, Some(meta.sha_history[0]));
+            meta.sha_history[0]
+        };
+
+        // Write second version and sweep
+        clock.advance(Duration::from_secs(100));
+        operations::write_local(&data_root, 2, 0, b"version 2").unwrap();
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            if let Some(meta) = cp.get_mut(2) {
+                meta.mutated_time = clock.as_ref().now();
+            }
+        }
+        sweeper.sweep().await.unwrap();
+
+        // Verify sha_history has two entries, newest first
+        let sha2 = {
+            let cp = sweeper.checkpoint.read().unwrap();
+            let meta = cp.get(2).unwrap();
+            assert_eq!(meta.sha_history.len(), 2);
+            assert_eq!(meta.checkpointed_sha256, Some(meta.sha_history[0]));
+            assert_ne!(meta.sha_history[0], sha1); // New SHA is different
+            assert_eq!(meta.sha_history[1], sha1); // Old SHA is second
+            meta.sha_history[0]
+        };
+
+        // Verify both versions are in cloud storage
+        let v1_data = sweeper.cloud.download_by_hash(sha1, "test.txt").await.unwrap();
+        assert_eq!(v1_data, b"version 1");
+        let v2_data = sweeper.cloud.download_by_hash(sha2, "test.txt").await.unwrap();
+        assert_eq!(v2_data, b"version 2");
+    }
+
+    #[tokio::test]
+    async fn test_sha_history_purges_old_versions() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let sweeper = create_test_sweeper(dir.path(), &clock);
+
+        // Set high free space (no eviction needed)
+        sweeper.set_free_space_for_test(10_000_000);
+
+        // Config has version_count = 3, so we'll create 4 versions
+        // and verify the oldest gets purged
+        let data_root = sweeper.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+
+        // Add file metadata
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
+        }
+
+        let mut shas = Vec::new();
+
+        // Create 4 versions (version_count = 3)
+        for i in 0..4 {
+            clock.advance(Duration::from_secs(100));
+            let content = format!("version {}", i);
+            operations::write_local(&data_root, 2, 0, content.as_bytes()).unwrap();
+            {
+                let mut cp = sweeper.checkpoint.write().unwrap();
+                if let Some(meta) = cp.get_mut(2) {
+                    meta.mutated_time = clock.as_ref().now();
+                }
+            }
+            sweeper.sweep().await.unwrap();
+
+            // Record the SHA
+            let sha = {
+                let cp = sweeper.checkpoint.read().unwrap();
+                let meta = cp.get(2).unwrap();
+                meta.checkpointed_sha256.unwrap()
+            };
+            shas.push(sha);
+        }
+
+        // Verify sha_history has exactly version_count entries (3)
+        {
+            let cp = sweeper.checkpoint.read().unwrap();
+            let meta = cp.get(2).unwrap();
+            assert_eq!(meta.sha_history.len(), 3, "sha_history should have exactly version_count entries");
+            // Most recent first
+            assert_eq!(meta.sha_history[0], shas[3]);
+            assert_eq!(meta.sha_history[1], shas[2]);
+            assert_eq!(meta.sha_history[2], shas[1]);
+            // shas[0] (the oldest) should have been purged from history
+        }
+
+        // Verify newest 3 versions are still in cloud
+        for i in 1..4 {
+            let data = sweeper.cloud.download_by_hash(shas[i], "test.txt").await;
+            assert!(data.is_ok(), "Version {} should still be in cloud", i);
+        }
+
+        // Verify oldest version was purged from cloud
+        let oldest_data = sweeper.cloud.download_by_hash(shas[0], "test.txt").await;
+        assert!(oldest_data.is_err(), "Version 0 should have been purged from cloud");
+    }
+
+    #[tokio::test]
+    async fn test_sha_history_deduplication() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let sweeper = create_test_sweeper(dir.path(), &clock);
+
+        // Set high free space (no eviction needed)
+        sweeper.set_free_space_for_test(10_000_000);
+
+        let data_root = sweeper.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+
+        // Add file metadata
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
+        }
+
+        // Write version A and sweep
+        operations::write_local(&data_root, 2, 0, b"content A").unwrap();
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            if let Some(meta) = cp.get_mut(2) {
+                meta.mutated_time = clock.as_ref().now();
+            }
+        }
+        sweeper.sweep().await.unwrap();
+
+        let sha_a = {
+            let cp = sweeper.checkpoint.read().unwrap();
+            cp.get(2).unwrap().checkpointed_sha256.unwrap()
+        };
+
+        // Write version B
+        clock.advance(Duration::from_secs(100));
+        operations::write_local(&data_root, 2, 0, b"content B").unwrap();
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            if let Some(meta) = cp.get_mut(2) {
+                meta.mutated_time = clock.as_ref().now();
+            }
+        }
+        sweeper.sweep().await.unwrap();
+
+        let sha_b = {
+            let cp = sweeper.checkpoint.read().unwrap();
+            cp.get(2).unwrap().checkpointed_sha256.unwrap()
+        };
+
+        // Revert to content A (same content as before)
+        clock.advance(Duration::from_secs(100));
+        operations::write_local(&data_root, 2, 0, b"content A").unwrap();
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            if let Some(meta) = cp.get_mut(2) {
+                meta.mutated_time = clock.as_ref().now();
+            }
+        }
+        sweeper.sweep().await.unwrap();
+
+        // Verify sha_history doesn't have duplicate sha_a
+        // It should be: [sha_a, sha_b] (sha_a moved to front, no duplicate)
+        {
+            let cp = sweeper.checkpoint.read().unwrap();
+            let meta = cp.get(2).unwrap();
+            assert_eq!(meta.sha_history.len(), 2, "sha_history should have 2 unique entries");
+            assert_eq!(meta.checkpointed_sha256, Some(sha_a));
+            assert_eq!(meta.sha_history[0], sha_a); // sha_a moved to front
+            assert_eq!(meta.sha_history[1], sha_b); // sha_b is second
+        }
     }
 }
