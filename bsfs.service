@@ -1,0 +1,31 @@
+[Unit]
+Description=Backup Storage File System (BSFS)
+Documentation=file:/mnt/data/bsfs/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/mnt/data/bsfs/target/release/bsfs --foreground --mount /mnt/bsfs --config /mnt/data/storage/config.json
+ExecStop=/bin/fusermount -u /mnt/bsfs
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/mnt/bsfs /mnt/data/storage
+
+# Allow FUSE operations
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bsfs
+
+[Install]
+WantedBy=multi-user.target
