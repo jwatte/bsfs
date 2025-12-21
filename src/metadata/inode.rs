@@ -214,6 +214,16 @@ impl InodeMetadata {
         }
     }
 
+    /// Compute the cloud storage key for this file's checkpointed version
+    /// Format: `{sha256[0:2]}/{sha256[0:4]}/{sha256}.{filename}`
+    /// Returns None if not checkpointed
+    pub fn cloud_key(&self) -> Option<String> {
+        self.checkpointed_sha256.map(|sha256| {
+            let hex = hex::encode(sha256);
+            format!("{}/{}/{}.{}", &hex[0..2], &hex[0..4], hex, self.filename)
+        })
+    }
+
     /// Convert to fuser FileAttr
     pub fn to_file_attr(&self) -> fuser::FileAttr {
         let kind = match self.file_type {

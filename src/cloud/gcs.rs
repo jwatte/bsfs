@@ -61,25 +61,115 @@ impl GcsStorage {
         })
     }
 
-    /// Get the object name for an inode version
-    fn object_name(inode: u64, version: &str) -> String {
-        format!("inodes/{}/{}", inode, version)
+    /// Generate object key from SHA256 and filename
+    /// Format: `{sha256[0:2]}/{sha256[0:4]}/{sha256}.{filename}`
+    fn object_key(sha256: [u8; 32], filename: &str) -> String {
+        let hex = hex::encode(sha256);
+        format!("{}/{}/{}.{}", &hex[0..2], &hex[0..4], hex, filename)
     }
 
-    /// Get the prefix for all versions of an inode
-    fn inode_prefix(inode: u64) -> String {
-        format!("inodes/{}/", inode)
-    }
-
-    /// Parse version ID from object name
+    /// Parse version ID from object name (returns the full key)
+    #[allow(dead_code)]
     fn parse_version(object_name: &str) -> Option<String> {
-        object_name.rsplit('/').next().map(String::from)
+        Some(object_name.to_string())
+    }
+
+    /// Get the object name for a checkpoint version
+    fn checkpoint_object_name(version: &str) -> String {
+        format!("checkpoints/{}", version)
+    }
+
+    /// Get the prefix for all checkpoint versions
+    #[allow(dead_code)]
+    fn checkpoint_prefix() -> &'static str {
+        "checkpoints/"
     }
 }
 
 #[async_trait]
 impl CloudStorage for GcsStorage {
-    async fn upload(&self, inode: u64, data: &[u8], sha256: [u8; 32]) -> Result<String> {
+    async fn upload(&self, _inode: u64, data: &[u8], sha256: [u8; 32], filename: &str) -> Result<String> {
+        let object_name = Self::object_key(sha256, filename);
+
+        let upload_type = UploadType::Simple(Media::new(object_name.clone()));
+        let req = UploadObjectRequest {
+            bucket: self.bucket.clone(),
+            ..Default::default()
+        };
+
+        self.client
+            .upload_object(&req, data.to_vec(), &upload_type)
+            .await
+            .map_err(|e| BsfsError::CloudStorage(e.to_string()))?;
+
+        Ok(object_name)
+    }
+
+    async fn download(&self, _inode: u64, version_id: Option<&str>) -> Result<Vec<u8>> {
+        let object_name = version_id
+            .ok_or_else(|| BsfsError::FileNotFound("version_id required for download".to_string()))?;
+
+        let data = self
+            .client
+            .download_object(
+                &GetObjectRequest {
+                    bucket: self.bucket.clone(),
+                    object: object_name.to_string(),
+                    ..Default::default()
+                },
+                &Range::default(),
+            )
+            .await
+            .map_err(|e| BsfsError::CloudStorage(e.to_string()))?;
+
+        Ok(data)
+    }
+
+    async fn download_by_hash(&self, sha256: [u8; 32], filename: &str) -> Result<Vec<u8>> {
+        let object_name = Self::object_key(sha256, filename);
+
+        let data = self
+            .client
+            .download_object(
+                &GetObjectRequest {
+                    bucket: self.bucket.clone(),
+                    object: object_name,
+                    ..Default::default()
+                },
+                &Range::default(),
+            )
+            .await
+            .map_err(|e| BsfsError::CloudStorage(e.to_string()))?;
+
+        Ok(data)
+    }
+
+    async fn list_versions(&self, _inode: u64) -> Result<Vec<VersionInfo>> {
+        // With SHA256-based keys, versions must be tracked in metadata
+        // This method is deprecated - use metadata to track version history
+        Ok(Vec::new())
+    }
+
+    async fn delete_old_versions(&self, _inode: u64, _keep_count: u32) -> Result<()> {
+        // With SHA256-based keys, version cleanup must be done via metadata
+        // which tracks the keys. Use delete_by_key to remove specific versions.
+        Ok(())
+    }
+
+    async fn delete_by_key(&self, key: &str) -> Result<()> {
+        self.client
+            .delete_object(&DeleteObjectRequest {
+                bucket: self.bucket.clone(),
+                object: key.to_string(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| BsfsError::CloudStorage(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn upload_checkpoint(&self, data: &[u8]) -> Result<String> {
         // Use timestamp as version ID
         let version_id = self
             .clock
@@ -89,10 +179,7 @@ impl CloudStorage for GcsStorage {
             .as_nanos()
             .to_string();
 
-        let object_name = Self::object_name(inode, &version_id);
-
-        // Store SHA256 as custom metadata (TODO: add to object metadata)
-        let _sha256_hex = hex::encode(sha256);
+        let object_name = Self::checkpoint_object_name(&version_id);
 
         let upload_type = UploadType::Simple(Media::new(object_name.clone()));
         let req = UploadObjectRequest {
@@ -108,16 +195,16 @@ impl CloudStorage for GcsStorage {
         Ok(version_id)
     }
 
-    async fn download(&self, inode: u64, version_id: Option<&str>) -> Result<Vec<u8>> {
+    async fn download_checkpoint(&self, version_id: Option<&str>) -> Result<Vec<u8>> {
         let object_name = match version_id {
-            Some(vid) => Self::object_name(inode, vid),
+            Some(vid) => Self::checkpoint_object_name(vid),
             None => {
                 // Get latest version
-                let versions = self.list_versions(inode).await?;
+                let versions = self.list_checkpoint_versions().await?;
                 let latest = versions
                     .last()
-                    .ok_or_else(|| BsfsError::FileNotFound(format!("inode {}", inode)))?;
-                Self::object_name(inode, &latest.version_id)
+                    .ok_or_else(|| BsfsError::FileNotFound("checkpoint".to_string()))?;
+                Self::checkpoint_object_name(&latest.version_id)
             }
         };
 
@@ -137,8 +224,8 @@ impl CloudStorage for GcsStorage {
         Ok(data)
     }
 
-    async fn list_versions(&self, inode: u64) -> Result<Vec<VersionInfo>> {
-        let prefix = Self::inode_prefix(inode);
+    async fn list_checkpoint_versions(&self) -> Result<Vec<VersionInfo>> {
+        let prefix = Self::checkpoint_prefix().to_string();
 
         let objects = self
             .client
@@ -165,29 +252,4 @@ impl CloudStorage for GcsStorage {
 
         Ok(versions)
     }
-
-    async fn delete_old_versions(&self, inode: u64, keep_count: u32) -> Result<()> {
-        let versions = self.list_versions(inode).await?;
-
-        if versions.len() <= keep_count as usize {
-            return Ok(());
-        }
-
-        let to_delete = &versions[..versions.len() - keep_count as usize];
-
-        for version in to_delete {
-            let object_name = Self::object_name(inode, &version.version_id);
-            self.client
-                .delete_object(&DeleteObjectRequest {
-                    bucket: self.bucket.clone(),
-                    object: object_name,
-                    ..Default::default()
-                })
-                .await
-                .map_err(|e| BsfsError::CloudStorage(e.to_string()))?;
-        }
-
-        Ok(())
-    }
-
 }

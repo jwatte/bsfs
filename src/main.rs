@@ -19,6 +19,35 @@ use config::Config;
 #[derive(Parser, Debug)]
 #[command(name = "bsfs")]
 #[command(about = "Backup Storage File System - a userspace FS with cloud archival")]
+#[command(after_help = r#"EXAMPLE CONFIG.JSON:
+{
+    "local_root": "/data/bsfs",
+    "gcs_bucket": "my-backup-bucket",
+    "gcs_credentials": {
+        "type": "service_account_file",
+        "path": "/path/to/service-account.json"
+    },
+    "target_free_space": 10737418240,
+    "sweep_interval_secs": 300,
+    "version_count": 5,
+    "inconsistent_start": false
+}
+
+CONFIG FIELDS:
+  local_root           (required) Local directory for file storage
+  gcs_bucket           (required) GCS bucket name for cloud archival
+  gcs_credentials      (optional) Authentication method:
+                         - {"type": "ambient"} (default, uses VM metadata)
+                         - {"type": "service_account_file", "path": "..."}
+                         - {"type": "service_account_key", "key": "..."}
+  target_free_space    (optional) Bytes to keep free locally (default: 10GB)
+  sweep_interval_secs  (optional) Archival check frequency (default: 300)
+  version_count        (optional) Cloud backup versions to keep (default: 5)
+  inconsistent_start   (optional) Allow future timestamps on startup (default: false)
+  max_storage          (optional) Max storage capacity in bytes (default: 0 = use physical storage)
+                         - When 0, statfs returns underlying filesystem stats
+                         - When > 0, statfs returns max_storage minus locally stored data
+                         - target_free_space must be smaller than max_storage"#)]
 struct Args {
     /// Mount point
     #[arg(short, long)]

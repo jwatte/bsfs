@@ -63,16 +63,15 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
     /// Perform a single sweep cycle:
     /// 1. Checkpoint any modified files to cloud (proactive backup)
     /// 2. If low on disk space, evict cold files that are safely checkpointed
+    /// 3. Save checkpoint to disk and upload to cloud (only if changes were made)
     async fn sweep(&self) -> Result<()> {
         tracing::debug!("Starting sweep");
 
-        // Phase 1: Checkpoint modified files to cloud (regardless of space pressure)
-        let checkpointed_any = self.checkpoint_modified_files().await?;
+        let mut checkpoint_changed = false;
 
-        if checkpointed_any {
-            // Save checkpoint to disk so cloud state is recorded
-            // This must happen BEFORE any local file deletion
-            self.save_checkpoint()?;
+        // Phase 1: Checkpoint modified files to cloud (regardless of space pressure)
+        if self.checkpoint_modified_files().await? {
+            checkpoint_changed = true;
         }
 
         // Phase 2: Evict local data only if we're low on space
@@ -83,9 +82,17 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
                 free_space,
                 self.config.target_free_space
             );
-            self.evict_cold_files().await?;
+            if self.evict_cold_files().await? {
+                checkpoint_changed = true;
+            }
         } else {
             tracing::debug!("Sufficient free space: {} bytes", free_space);
+        }
+
+        // Phase 3: Save and upload checkpoint only if there were changes
+        if checkpoint_changed {
+            self.save_checkpoint()?;
+            self.upload_checkpoint_to_cloud().await?;
         }
 
         Ok(())
@@ -107,14 +114,22 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
 
         let data_root = self.config.data_root();
 
+        let mut any_uploaded = false;
         for inode in files_needing_checkpoint {
-            if let Err(e) = self.checkpoint_file_to_cloud(&data_root, inode).await {
-                tracing::error!("Failed to checkpoint inode {}: {}", inode, e);
-                // Continue with other files
+            match self.checkpoint_file_to_cloud(&data_root, inode).await {
+                Ok(uploaded) => {
+                    if uploaded {
+                        any_uploaded = true;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to checkpoint inode {}: {}", inode, e);
+                    // Continue with other files
+                }
             }
         }
 
-        Ok(true)
+        Ok(any_uploaded)
     }
 
     /// Find files that have been modified since their last checkpoint
@@ -133,16 +148,45 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
     }
 
     /// Upload a single file to cloud storage
+    /// Returns true if the file was actually uploaded (content changed)
     async fn checkpoint_file_to_cloud(
         &self,
         data_root: &std::path::Path,
         inode: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        // Get filename and current checkpointed SHA256 from metadata
+        let (filename, current_sha256) = {
+            let cp = self.checkpoint.read().unwrap();
+            let meta = cp.get(inode);
+            (
+                meta.map(|m| m.filename.clone())
+                    .unwrap_or_else(|| format!("{}", inode)),
+                meta.and_then(|m| m.checkpointed_sha256),
+            )
+        };
+
+        // Compute SHA256 of current file content
+        let new_sha256 = operations::compute_sha256(data_root, inode)?;
+
+        // Skip upload if content hasn't changed (same SHA256 = same cloud key)
+        if Some(new_sha256) == current_sha256 {
+            tracing::debug!(
+                "Skipping upload for inode {} - content unchanged (SHA256 matches)",
+                inode
+            );
+            // Update checkpointed_time to prevent repeated checks
+            let mut cp = self.checkpoint.write().unwrap();
+            if let Some(meta) = cp.get_mut(inode) {
+                meta.checkpointed_time = Some(self.clock.as_ref().now());
+            }
+            return Ok(false);
+        }
+
         tracing::debug!("Uploading inode {} to cloud storage", inode);
 
         // Upload to cloud
         let (_version_id, sha256) =
-            operations::upload_to_cloud(self.cloud.as_ref(), data_root, inode).await?;
+            operations::upload_to_cloud(self.cloud.as_ref(), data_root, inode, &filename).await?;
 
         // Update in-memory metadata
         {
@@ -153,18 +197,15 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
             }
         }
 
-        // Delete old versions in cloud
-        self.cloud
-            .delete_old_versions(inode, self.config.version_count)
-            .await?;
-
-        Ok(())
+        Ok(true)
     }
 
     /// Evict cold files from local storage to free up disk space
     /// Only evicts files that are safely checkpointed to cloud
-    async fn evict_cold_files(&self) -> Result<()> {
+    /// Returns true if any files were evicted
+    async fn evict_cold_files(&self) -> Result<bool> {
         let data_root = self.config.data_root();
+        let mut evicted_any = false;
 
         loop {
             // Check if we have enough space now
@@ -201,9 +242,10 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
             // Save checkpoint immediately after each deletion
             // This ensures we don't lose track of the eviction if we crash
             self.save_checkpoint()?;
+            evicted_any = true;
         }
 
-        Ok(())
+        Ok(evicted_any)
     }
 
     /// Find the next cold file that can be safely evicted
@@ -264,6 +306,20 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         tracing::debug!("Checkpoint saved and log truncated");
         Ok(())
     }
+
+    /// Upload checkpoint to cloud storage
+    async fn upload_checkpoint_to_cloud(&self) -> Result<()> {
+        // Read the checkpoint file from disk
+        let checkpoint_path = self.config.checkpoint_path();
+        let data = std::fs::read(&checkpoint_path)?;
+
+        tracing::info!("Uploading checkpoint to cloud storage ({} bytes)", data.len());
+
+        let version_id = self.cloud.upload_checkpoint(&data).await?;
+
+        tracing::info!("Checkpoint uploaded to cloud with version {}", version_id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +340,7 @@ mod tests {
             sweep_interval_secs: 60,
             version_count: 3,
             inconsistent_start: false,
+            max_storage: 0,
         }
     }
 
@@ -553,15 +610,17 @@ mod tests {
         sweeper.checkpoint_file_to_cloud(&data_root, 2).await.unwrap();
 
         // Verify metadata was updated
-        {
+        let sha256 = {
             let cp = sweeper.checkpoint.read().unwrap();
             let meta = cp.get(2).unwrap();
             assert!(meta.checkpointed_time.is_some());
             assert!(meta.checkpointed_sha256.is_some());
-        }
+            assert!(meta.cloud_key().is_some());
+            meta.checkpointed_sha256.unwrap()
+        };
 
         // Verify file is in cloud storage
-        let cloud_data = sweeper.cloud.download(2, None).await.unwrap();
+        let cloud_data = sweeper.cloud.download_by_hash(sha256, "test.txt").await.unwrap();
         assert_eq!(cloud_data, b"test content");
     }
 
@@ -599,17 +658,19 @@ mod tests {
         // Run sweep
         sweeper.sweep().await.unwrap();
 
-        // File should be checkpointed to cloud
-        let cloud_data = sweeper.cloud.download(2, None).await.unwrap();
-        assert_eq!(cloud_data, b"test content");
-
-        // File should be evicted (local_data_present = false)
-        {
+        // File should be checkpointed to cloud and evicted
+        let sha256 = {
             let cp = sweeper.checkpoint.read().unwrap();
             let meta = cp.get(2).unwrap();
             assert!(meta.checkpointed_sha256.is_some());
+            assert!(meta.cloud_key().is_some());
             assert!(!meta.local_data_present);
-        }
+            meta.checkpointed_sha256.unwrap()
+        };
+
+        // Verify file is in cloud storage
+        let cloud_data = sweeper.cloud.download_by_hash(sha256, "test.txt").await.unwrap();
+        assert_eq!(cloud_data, b"test content");
 
         // Local file should be deleted
         assert!(!operations::local_data_exists(&data_root, 2));
@@ -644,17 +705,19 @@ mod tests {
         // Run sweep
         sweeper.sweep().await.unwrap();
 
-        // File should be checkpointed to cloud (proactive)
-        let cloud_data = sweeper.cloud.download(2, None).await.unwrap();
-        assert_eq!(cloud_data, b"test content");
-
-        // But NOT evicted (still has local data)
-        {
+        // File should be checkpointed to cloud (proactive) but NOT evicted
+        let sha256 = {
             let cp = sweeper.checkpoint.read().unwrap();
             let meta = cp.get(2).unwrap();
             assert!(meta.checkpointed_sha256.is_some());
+            assert!(meta.cloud_key().is_some());
             assert!(meta.local_data_present); // Still present locally
-        }
+            meta.checkpointed_sha256.unwrap()
+        };
+
+        // Verify file is in cloud storage
+        let cloud_data = sweeper.cloud.download_by_hash(sha256, "test.txt").await.unwrap();
+        assert_eq!(cloud_data, b"test content");
 
         // Local file should still exist
         assert!(operations::local_data_exists(&data_root, 2));
@@ -678,7 +741,7 @@ mod tests {
         operations::create_local_file(&data_root, 3).unwrap();
         operations::write_local(&data_root, 3, 0, b"new file").unwrap();
         let sha3 = operations::compute_sha256(&data_root, 3).unwrap();
-        sweeper.cloud.upload(3, b"new file", sha3).await.unwrap();
+        let _key3 = sweeper.cloud.upload(3, b"new file", sha3, "new.txt").await.unwrap();
 
         {
             let mut cp = sweeper.checkpoint.write().unwrap();
@@ -695,6 +758,7 @@ mod tests {
             file2.closed_time = clock.as_ref().now();
             file2.checkpointed_time = Some(clock.as_ref().now());
             file2.checkpointed_sha256 = Some(sha3);
+            // cloud_key() is computed from sha256 + filename
             cp.insert(file2);
         }
 
@@ -714,15 +778,144 @@ mod tests {
         // 3. Then evict file 2 (now checkpointed)
         sweeper.sweep().await.unwrap();
 
-        // Both files should now be in cloud
-        assert!(sweeper.cloud.download(2, None).await.is_ok());
-        assert!(sweeper.cloud.download(3, None).await.is_ok());
-
-        // Both files should be evicted
-        {
+        // Both files should be checkpointed and evicted
+        let (key2, key3) = {
             let cp = sweeper.checkpoint.read().unwrap();
-            assert!(!cp.get(2).unwrap().local_data_present);
-            assert!(!cp.get(3).unwrap().local_data_present);
+            let meta2 = cp.get(2).unwrap();
+            let meta3 = cp.get(3).unwrap();
+
+            // Both should have cloud keys (computed from sha256 + filename)
+            assert!(meta2.cloud_key().is_some());
+            assert!(meta3.cloud_key().is_some());
+
+            // Both should be evicted
+            assert!(!meta2.local_data_present);
+            assert!(!meta3.local_data_present);
+
+            (meta2.cloud_key().unwrap(), meta3.cloud_key().unwrap())
+        };
+
+        // Verify we can download by key
+        assert!(sweeper.cloud.download(2, Some(&key2)).await.is_ok());
+        assert!(sweeper.cloud.download(3, Some(&key3)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sweep_uploads_checkpoint_to_cloud() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let sweeper = create_test_sweeper(dir.path(), &clock);
+
+        // Create a local file
+        let data_root = sweeper.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+        operations::write_local(&data_root, 2, 0, b"test content").unwrap();
+
+        // Add file metadata (not checkpointed)
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
         }
+
+        // Set high free space (no eviction needed)
+        sweeper.set_free_space_for_test(10_000_000);
+
+        // Before sweep: no checkpoint in cloud
+        let versions_before = sweeper.cloud.list_checkpoint_versions().await.unwrap();
+        assert!(versions_before.is_empty());
+
+        // Run sweep - should checkpoint file and upload checkpoint to cloud
+        sweeper.sweep().await.unwrap();
+
+        // After sweep: checkpoint should be in cloud
+        let versions_after = sweeper.cloud.list_checkpoint_versions().await.unwrap();
+        assert_eq!(versions_after.len(), 1);
+
+        // Download and verify checkpoint contains our file
+        let checkpoint_data = sweeper.cloud.download_checkpoint(None).await.unwrap();
+        assert!(!checkpoint_data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sweep_creates_new_checkpoint_versions() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let sweeper = create_test_sweeper(dir.path(), &clock);
+
+        // Set high free space (no eviction needed)
+        sweeper.set_free_space_for_test(10_000_000);
+
+        // Create first file and sweep
+        let data_root = sweeper.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+        operations::write_local(&data_root, 2, 0, b"file1").unwrap();
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 2, "file1.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
+        }
+        sweeper.sweep().await.unwrap();
+
+        let versions_after_first = sweeper.cloud.list_checkpoint_versions().await.unwrap();
+        assert_eq!(versions_after_first.len(), 1);
+
+        // Create second file and sweep again
+        clock.advance(Duration::from_secs(100));
+        operations::create_local_file(&data_root, 3).unwrap();
+        operations::write_local(&data_root, 3, 0, b"file2").unwrap();
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 3, "file2.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
+        }
+        sweeper.sweep().await.unwrap();
+
+        // Should now have two checkpoint versions
+        let versions_after_second = sweeper.cloud.list_checkpoint_versions().await.unwrap();
+        assert_eq!(versions_after_second.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_no_changes_skips_checkpoint_upload() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let sweeper = create_test_sweeper(dir.path(), &clock);
+
+        // Set high free space (no eviction needed)
+        sweeper.set_free_space_for_test(10_000_000);
+
+        // Create a file and run first sweep
+        let data_root = sweeper.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+        operations::write_local(&data_root, 2, 0, b"test content").unwrap();
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
+        }
+
+        // First sweep - should checkpoint the file and upload checkpoint
+        sweeper.sweep().await.unwrap();
+
+        let versions_after_first = sweeper.cloud.list_checkpoint_versions().await.unwrap();
+        assert_eq!(versions_after_first.len(), 1);
+
+        // Second sweep - no changes, should NOT upload a new checkpoint
+        clock.advance(Duration::from_secs(60));
+        sweeper.sweep().await.unwrap();
+
+        let versions_after_second = sweeper.cloud.list_checkpoint_versions().await.unwrap();
+        assert_eq!(versions_after_second.len(), 1); // Still just 1!
+
+        // Third sweep - still no changes
+        clock.advance(Duration::from_secs(60));
+        sweeper.sweep().await.unwrap();
+
+        let versions_after_third = sweeper.cloud.list_checkpoint_versions().await.unwrap();
+        assert_eq!(versions_after_third.len(), 1); // Still just 1!
     }
 }

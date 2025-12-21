@@ -1,6 +1,6 @@
 use fuser::{
-    FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -69,6 +69,16 @@ impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
         self.config.data_root()
     }
 
+    /// Calculate total size of locally stored data
+    fn total_local_storage(&self) -> u64 {
+        let cp = self.checkpoint.read().unwrap();
+        cp.inodes
+            .values()
+            .filter(|m| m.local_data_present)
+            .map(|m| m.size)
+            .sum()
+    }
+
     /// Ensure local data is present, fetching from cloud if needed
     fn ensure_local_data(&self, inode: u64) -> Result<(), libc::c_int> {
         let cp = self.checkpoint.read().unwrap();
@@ -78,10 +88,10 @@ impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
             return Ok(());
         }
 
-        // Need to fetch from cloud
+        // Need to fetch from cloud - compute key from sha256 + filename
         let cloud = Arc::clone(&self.cloud);
         let data_root = self.data_root();
-        let version_id = meta.checkpointed_sha256.map(|sha| hex::encode(sha));
+        let version_id = meta.cloud_key();
 
         drop(cp); // Release lock before async operation
 
@@ -825,5 +835,49 @@ impl<C: CloudStorage + 'static> Filesystem for BsfsFilesystem<C> {
             let _ = log.flush();
         }
         reply.ok();
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        const BLOCK_SIZE: u64 = 4096;
+
+        if self.config.max_storage > 0 {
+            // Use configured max_storage
+            let total_stored = self.total_local_storage();
+            let free_bytes = self.config.max_storage.saturating_sub(total_stored);
+
+            let total_blocks = self.config.max_storage / BLOCK_SIZE;
+            let free_blocks = free_bytes / BLOCK_SIZE;
+            let avail_blocks = free_blocks;
+
+            reply.statfs(
+                total_blocks,            // blocks
+                free_blocks,             // bfree
+                avail_blocks,            // bavail
+                0,                       // files (not tracked)
+                0,                       // ffree
+                BLOCK_SIZE as u32,       // bsize
+                255,                     // namelen
+                BLOCK_SIZE as u32,       // frsize
+            );
+        } else {
+            // Use underlying physical storage
+            match nix::sys::statvfs::statvfs(&self.config.local_root) {
+                Ok(stat) => {
+                    reply.statfs(
+                        stat.blocks(),
+                        stat.blocks_free(),
+                        stat.blocks_available(),
+                        stat.files(),
+                        stat.files_free(),
+                        stat.block_size() as u32,
+                        255,
+                        stat.fragment_size() as u32,
+                    );
+                }
+                Err(_) => {
+                    reply.error(libc::EIO);
+                }
+            }
+        }
     }
 }

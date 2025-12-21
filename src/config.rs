@@ -31,6 +31,10 @@ pub struct Config {
     /// instead of refusing to start
     #[serde(default)]
     pub inconsistent_start: bool,
+
+    /// Maximum storage capacity in bytes (0 = use underlying physical storage)
+    #[serde(default)]
+    pub max_storage: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -92,17 +96,24 @@ impl Config {
             }
         }
 
+        // Validate target_free_space is smaller than max_storage when max_storage > 0
+        if self.max_storage > 0 && self.target_free_space >= self.max_storage {
+            return Err(BsfsError::Config(
+                "target_free_space must be smaller than max_storage".into(),
+            ));
+        }
+
         Ok(())
     }
 
     /// Get the path to the checkpoint file
     pub fn checkpoint_path(&self) -> PathBuf {
-        self.local_root.join(".bsfs_checkpoint")
+        self.local_root.join("bsfs_checkpoint")
     }
 
     /// Get the path to the metadata log file
     pub fn log_path(&self) -> PathBuf {
-        self.local_root.join(".bsfs_log")
+        self.local_root.join("bsfs_log")
     }
 
     /// Get the path to the data directory (where inode data files are stored)
@@ -128,6 +139,7 @@ mod tests {
         assert_eq!(config.sweep_interval_secs, 300);
         assert_eq!(config.version_count, 5);
         assert!(!config.inconsistent_start);
+        assert_eq!(config.max_storage, 0);
     }
 
     #[test]
@@ -174,5 +186,56 @@ mod tests {
         }"#;
         let result = Config::from_json(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_storage_with_valid_target_free_space() {
+        let json = r#"{
+            "local_root": "/tmp/bsfs",
+            "gcs_bucket": "bucket",
+            "max_storage": 107374182400,
+            "target_free_space": 10737418240
+        }"#;
+        let config = Config::from_json(json).unwrap();
+        assert_eq!(config.max_storage, 107374182400);
+        assert_eq!(config.target_free_space, 10737418240);
+    }
+
+    #[test]
+    fn test_target_free_space_equals_max_storage_fails() {
+        let json = r#"{
+            "local_root": "/tmp/bsfs",
+            "gcs_bucket": "bucket",
+            "max_storage": 10737418240,
+            "target_free_space": 10737418240
+        }"#;
+        let result = Config::from_json(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_target_free_space_exceeds_max_storage_fails() {
+        let json = r#"{
+            "local_root": "/tmp/bsfs",
+            "gcs_bucket": "bucket",
+            "max_storage": 5368709120,
+            "target_free_space": 10737418240
+        }"#;
+        let result = Config::from_json(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_storage_zero_allows_any_target_free_space() {
+        let json = r#"{
+            "local_root": "/tmp/bsfs",
+            "gcs_bucket": "bucket",
+            "max_storage": 0,
+            "target_free_space": 10737418240
+        }"#;
+        // When max_storage is 0, target_free_space can be anything
+        let config = Config::from_json(json).unwrap();
+        assert_eq!(config.max_storage, 0);
+        assert_eq!(config.target_free_space, 10737418240);
     }
 }

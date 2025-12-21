@@ -137,16 +137,18 @@ pub async fn fetch_from_cloud<C: CloudStorage>(
 }
 
 /// Upload a local file to cloud storage
+/// Key format: `{sha256[0:2]}/{sha256[0:4]}/{sha256}.{filename}`
 pub async fn upload_to_cloud<C: CloudStorage>(
     cloud: &C,
     data_root: &Path,
     inode: u64,
+    filename: &str,
 ) -> Result<(String, [u8; 32])> {
     let path = inode_data_path(data_root, inode);
     let data = fs::read(&path)?;
     let sha256 = compute_sha256(data_root, inode)?;
 
-    let version_id = cloud.upload(inode, &data, sha256).await?;
+    let version_id = cloud.upload(inode, &data, sha256, filename).await?;
 
     Ok((version_id, sha256))
 }
