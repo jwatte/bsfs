@@ -220,3 +220,367 @@ impl<C: CloudStorage + 'static> UploadManager<C> {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::{Clock, MockClock};
+    use crate::cloud::traits::mock::MockCloudStorage;
+    use crate::fs::operations;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn create_test_config(dir: &std::path::Path) -> Config {
+        Config {
+            local_root: dir.to_path_buf(),
+            gcs_bucket: "test-bucket".into(),
+            gcs_credentials: crate::config::GcsCredentials::Ambient,
+            target_free_space: 1_000_000,
+            sweep_interval_secs: 60,
+            version_count: 3,
+            inconsistent_start: false,
+            max_storage: 0,
+            parallel_upload: 8,
+        }
+    }
+
+    fn create_test_upload_manager(
+        dir: &std::path::Path,
+        clock: &Arc<MockClock>,
+    ) -> (UploadManager<MockCloudStorage>, UploadSender, Arc<MockCloudStorage>) {
+        let config = create_test_config(dir);
+        let checkpoint = Arc::new(RwLock::new(Checkpoint::new(clock.as_ref(), 1000, 1000)));
+        let log_path = config.log_path();
+        let log = Arc::new(RwLock::new(MetadataLog::open(&log_path).unwrap()));
+        let cloud = Arc::new(MockCloudStorage::new());
+
+        let (manager, tx) = UploadManager::new(
+            config,
+            clock.clone() as SharedClock,
+            checkpoint,
+            log,
+            cloud.clone(),
+        );
+
+        (manager, tx, cloud)
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_basic() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (manager, _tx, cloud) = create_test_upload_manager(dir.path(), &clock);
+
+        // Create a local file
+        let data_root = manager.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+        operations::write_local(&data_root, 2, 0, b"test content").unwrap();
+
+        // Add file metadata
+        {
+            let mut cp = manager.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
+        }
+
+        // Upload the file
+        let uploaded = UploadManager::upload_file(
+            &data_root,
+            2,
+            &manager.checkpoint,
+            &manager.log,
+            cloud.as_ref(),
+            clock.as_ref(),
+            manager.config.version_count,
+        )
+        .await
+        .unwrap();
+
+        assert!(uploaded);
+
+        // Verify metadata was updated
+        let sha256 = {
+            let cp = manager.checkpoint.read().unwrap();
+            let meta = cp.get(2).unwrap();
+            assert!(meta.checkpointed_time.is_some());
+            assert!(meta.checkpointed_sha256.is_some());
+            assert_eq!(meta.sha_history.len(), 1);
+            meta.checkpointed_sha256.unwrap()
+        };
+
+        // Verify file is in cloud storage
+        let cloud_data = cloud.download_by_hash(sha256, "test.txt").await.unwrap();
+        assert_eq!(cloud_data, b"test content");
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_skips_unchanged_content() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (manager, _tx, cloud) = create_test_upload_manager(dir.path(), &clock);
+
+        // Create a local file
+        let data_root = manager.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+        operations::write_local(&data_root, 2, 0, b"test content").unwrap();
+
+        let sha256 = operations::compute_sha256(&data_root, 2).unwrap();
+
+        // Add file metadata with same SHA already checkpointed
+        {
+            let mut cp = manager.checkpoint.write().unwrap();
+            let mut file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            file.checkpointed_sha256 = Some(sha256);
+            file.checkpointed_time = Some(clock.now());
+            cp.insert(file);
+        }
+
+        // Try to upload - should skip
+        let uploaded = UploadManager::upload_file(
+            &data_root,
+            2,
+            &manager.checkpoint,
+            &manager.log,
+            cloud.as_ref(),
+            clock.as_ref(),
+            manager.config.version_count,
+        )
+        .await
+        .unwrap();
+
+        assert!(!uploaded);
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_deduplication() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (manager, _tx, cloud) = create_test_upload_manager(dir.path(), &clock);
+
+        // Create a local file
+        let data_root = manager.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+        operations::write_local(&data_root, 2, 0, b"test content").unwrap();
+
+        let sha256 = operations::compute_sha256(&data_root, 2).unwrap();
+
+        // Add file metadata with SHA in history but different current checkpointed_sha256
+        {
+            let mut cp = manager.checkpoint.write().unwrap();
+            let mut file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            file.checkpointed_sha256 = Some([0u8; 32]); // Different SHA
+            file.sha_history = vec![[0u8; 32], sha256]; // But target SHA is in history
+            cp.insert(file);
+        }
+
+        // Try to upload - should skip due to deduplication
+        let uploaded = UploadManager::upload_file(
+            &data_root,
+            2,
+            &manager.checkpoint,
+            &manager.log,
+            cloud.as_ref(),
+            clock.as_ref(),
+            manager.config.version_count,
+        )
+        .await
+        .unwrap();
+
+        assert!(!uploaded);
+
+        // Verify SHA was moved to front of history
+        let cp = manager.checkpoint.read().unwrap();
+        let meta = cp.get(2).unwrap();
+        assert_eq!(meta.checkpointed_sha256, Some(sha256));
+        assert_eq!(meta.sha_history[0], sha256);
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_logs_purge_for_old_versions() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (manager, _tx, cloud) = create_test_upload_manager(dir.path(), &clock);
+
+        let data_root = manager.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+
+        // Add file with version_count (3) existing versions in history
+        let existing_shas: Vec<[u8; 32]> = (0..3).map(|i| [i as u8; 32]).collect();
+        {
+            let mut cp = manager.checkpoint.write().unwrap();
+            let mut file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            file.sha_history = existing_shas.clone();
+            cp.insert(file);
+        }
+
+        // Write new content and upload
+        operations::write_local(&data_root, 2, 0, b"new content").unwrap();
+
+        let uploaded = UploadManager::upload_file(
+            &data_root,
+            2,
+            &manager.checkpoint,
+            &manager.log,
+            cloud.as_ref(),
+            clock.as_ref(),
+            manager.config.version_count,
+        )
+        .await
+        .unwrap();
+
+        assert!(uploaded);
+
+        // Verify sha_history has version_count entries
+        {
+            let cp = manager.checkpoint.read().unwrap();
+            let meta = cp.get(2).unwrap();
+            assert_eq!(meta.sha_history.len(), 3);
+            // Oldest SHA should have been removed
+            assert!(!meta.sha_history.contains(&existing_shas[2]));
+        }
+
+        // Verify a Purge log record was created
+        let log_path = manager.config.log_path();
+        let records = MetadataLog::read_all(&log_path).unwrap();
+        let purge_records: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r, LogRecord::Purge { .. }))
+            .collect();
+        assert_eq!(purge_records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_skips_directories() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (manager, _tx, cloud) = create_test_upload_manager(dir.path(), &clock);
+
+        // Add a directory
+        {
+            let mut cp = manager.checkpoint.write().unwrap();
+            let subdir = InodeMetadata::new_directory(clock.as_ref(), 2, "subdir".into(), 1, 1000, 1000, 0o755);
+            cp.insert(subdir);
+        }
+
+        let data_root = manager.config.data_root();
+        let uploaded = UploadManager::upload_file(
+            &data_root,
+            2,
+            &manager.checkpoint,
+            &manager.log,
+            cloud.as_ref(),
+            clock.as_ref(),
+            manager.config.version_count,
+        )
+        .await
+        .unwrap();
+
+        assert!(!uploaded);
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_skips_evicted_files() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (manager, _tx, cloud) = create_test_upload_manager(dir.path(), &clock);
+
+        // Add a file with local_data_present = false (evicted)
+        {
+            let mut cp = manager.checkpoint.write().unwrap();
+            let mut file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            file.local_data_present = false;
+            cp.insert(file);
+        }
+
+        let data_root = manager.config.data_root();
+        let uploaded = UploadManager::upload_file(
+            &data_root,
+            2,
+            &manager.checkpoint,
+            &manager.log,
+            cloud.as_ref(),
+            clock.as_ref(),
+            manager.config.version_count,
+        )
+        .await
+        .unwrap();
+
+        assert!(!uploaded);
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_handles_unknown_inode() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (manager, _tx, cloud) = create_test_upload_manager(dir.path(), &clock);
+
+        let data_root = manager.config.data_root();
+
+        // Try to upload non-existent inode
+        let uploaded = UploadManager::upload_file(
+            &data_root,
+            999,
+            &manager.checkpoint,
+            &manager.log,
+            cloud.as_ref(),
+            clock.as_ref(),
+            manager.config.version_count,
+        )
+        .await
+        .unwrap();
+
+        assert!(!uploaded);
+    }
+
+    #[tokio::test]
+    async fn test_upload_manager_processes_requests() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (manager, tx, cloud) = create_test_upload_manager(dir.path(), &clock);
+
+        // Create a local file
+        let data_root = manager.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+        operations::write_local(&data_root, 2, 0, b"test content").unwrap();
+
+        // Add file metadata
+        {
+            let mut cp = manager.checkpoint.write().unwrap();
+            let file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            cp.insert(file);
+        }
+
+        let checkpoint = manager.checkpoint.clone();
+
+        // Start the upload manager in a background task
+        let manager_handle = tokio::spawn(manager.run());
+
+        // Send an upload request
+        tx.send(UploadRequest { inode: 2 }).unwrap();
+
+        // Drop the sender to signal shutdown
+        drop(tx);
+
+        // Wait for manager to finish
+        let _ = tokio::time::timeout(Duration::from_secs(5), manager_handle).await;
+
+        // Verify file was uploaded
+        let sha256 = {
+            let cp = checkpoint.read().unwrap();
+            let meta = cp.get(2).unwrap();
+            assert!(meta.checkpointed_sha256.is_some());
+            meta.checkpointed_sha256.unwrap()
+        };
+
+        let cloud_data = cloud.download_by_hash(sha256, "test.txt").await.unwrap();
+        assert_eq!(cloud_data, b"test content");
+    }
+}
