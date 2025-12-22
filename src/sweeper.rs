@@ -1,5 +1,7 @@
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time::interval;
 
 use crate::clock::SharedClock;
@@ -93,6 +95,9 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
             self.purge_old_versions(&purge_entries).await;
         }
 
+        // Phase 2b: Process any pending purges from the log (from upload manager)
+        self.process_pending_purges().await?;
+
         // Phase 3: Evict local data only if we're low on space
         let free_space = self.get_free_space()?;
         if free_space < self.config.target_free_space {
@@ -145,6 +150,8 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
 
     /// Upload modified files to cloud storage (proactive checkpointing)
     /// Returns (uploaded_any, purge_entries) - whether any files were uploaded and list of old versions to purge
+    ///
+    /// Uploads run in parallel, limited by `parallel_upload` config setting.
     async fn checkpoint_modified_files(&self) -> Result<(bool, Vec<PurgeEntry>)> {
         let files_needing_checkpoint = self.find_files_needing_checkpoint();
 
@@ -153,26 +160,58 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         }
 
         tracing::info!(
-            "Checkpointing {} modified files to cloud",
-            files_needing_checkpoint.len()
+            "Checkpointing {} modified files to cloud (max {} parallel)",
+            files_needing_checkpoint.len(),
+            self.config.parallel_upload
         );
 
         let data_root = self.config.data_root();
+        let semaphore = Arc::new(Semaphore::new(self.config.parallel_upload as usize));
 
+        // Spawn upload tasks for each file
+        let mut handles = Vec::new();
+        for inode in files_needing_checkpoint {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let data_root = data_root.clone();
+            let checkpoint = self.checkpoint.clone();
+            let cloud = self.cloud.clone();
+            let clock = self.clock.clone();
+            let version_count = self.config.version_count;
+
+            let handle = tokio::spawn(async move {
+                let result = Self::checkpoint_file_to_cloud_static(
+                    &data_root,
+                    inode,
+                    &checkpoint,
+                    cloud.as_ref(),
+                    clock.as_ref(),
+                    version_count,
+                )
+                .await;
+                drop(permit); // Release semaphore permit
+                (inode, result)
+            });
+            handles.push(handle);
+        }
+
+        // Collect results
         let mut any_uploaded = false;
         let mut purge_entries = Vec::new();
 
-        for inode in files_needing_checkpoint {
-            match self.checkpoint_file_to_cloud(&data_root, inode).await {
-                Ok((uploaded, new_purge_entries)) => {
+        for handle in handles {
+            match handle.await {
+                Ok((_inode, Ok((uploaded, new_purge_entries)))) => {
                     if uploaded {
                         any_uploaded = true;
                     }
                     purge_entries.extend(new_purge_entries);
                 }
-                Err(e) => {
+                Ok((inode, Err(e))) => {
                     tracing::error!("Failed to checkpoint inode {}: {}", inode, e);
                     // Continue with other files
+                }
+                Err(e) => {
+                    tracing::error!("Upload task panicked: {}", e);
                 }
             }
         }
@@ -195,16 +234,38 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
             .collect()
     }
 
-    /// Upload a single file to cloud storage
+    /// Upload a single file to cloud storage (instance method for tests)
     /// Returns (uploaded, purge_entries) - whether file was uploaded and any old versions to purge
+    #[cfg(test)]
     async fn checkpoint_file_to_cloud(
         &self,
         data_root: &std::path::Path,
         inode: u64,
     ) -> Result<(bool, Vec<PurgeEntry>)> {
+        Self::checkpoint_file_to_cloud_static(
+            &data_root.to_path_buf(),
+            inode,
+            &self.checkpoint,
+            self.cloud.as_ref(),
+            self.clock.as_ref(),
+            self.config.version_count,
+        )
+        .await
+    }
+
+    /// Upload a single file to cloud storage (static version for parallel execution)
+    /// Returns (uploaded, purge_entries) - whether file was uploaded and any old versions to purge
+    async fn checkpoint_file_to_cloud_static(
+        data_root: &PathBuf,
+        inode: u64,
+        checkpoint: &Arc<RwLock<Checkpoint>>,
+        cloud: &C,
+        clock: &dyn crate::clock::Clock,
+        version_count: u32,
+    ) -> Result<(bool, Vec<PurgeEntry>)> {
         // Get filename, current checkpointed SHA256, and sha_history from metadata
         let (filename, current_sha256, sha_history) = {
-            let cp = self.checkpoint.read().unwrap();
+            let cp = checkpoint.read().unwrap();
             let meta = cp.get(inode);
             (
                 meta.map(|m| m.filename.clone())
@@ -224,9 +285,9 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
                 inode
             );
             // Update checkpointed_time to prevent repeated checks
-            let mut cp = self.checkpoint.write().unwrap();
+            let mut cp = checkpoint.write().unwrap();
             if let Some(meta) = cp.get_mut(inode) {
-                meta.checkpointed_time = Some(self.clock.as_ref().now());
+                meta.checkpointed_time = Some(clock.now());
             }
             return Ok((false, Vec::new()));
         }
@@ -238,9 +299,9 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
                 inode
             );
             // Update metadata but don't upload
-            let mut cp = self.checkpoint.write().unwrap();
+            let mut cp = checkpoint.write().unwrap();
             if let Some(meta) = cp.get_mut(inode) {
-                meta.checkpointed_time = Some(self.clock.as_ref().now());
+                meta.checkpointed_time = Some(clock.now());
                 meta.checkpointed_sha256 = Some(new_sha256);
                 // Move this SHA to the front of history (most recent)
                 meta.sha_history.retain(|&sha| sha != new_sha256);
@@ -253,22 +314,22 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
 
         // Upload to cloud
         let (_version_id, sha256) =
-            operations::upload_to_cloud(self.cloud.as_ref(), data_root, inode, &filename).await?;
+            operations::upload_to_cloud(cloud, data_root, inode, &filename).await?;
 
         // Update metadata and determine which old versions to purge
         let purge_entries = {
-            let mut cp = self.checkpoint.write().unwrap();
+            let mut cp = checkpoint.write().unwrap();
             let mut purge_entries = Vec::new();
 
             if let Some(meta) = cp.get_mut(inode) {
-                meta.checkpointed_time = Some(self.clock.as_ref().now());
+                meta.checkpointed_time = Some(clock.now());
                 meta.checkpointed_sha256 = Some(sha256);
 
                 // Add new SHA to history (at the front, most recent first)
                 meta.sha_history.insert(0, sha256);
 
                 // If history exceeds version_count, remove oldest entries and schedule for purging
-                let version_count = self.config.version_count as usize;
+                let version_count = version_count as usize;
                 while meta.sha_history.len() > version_count {
                     if let Some(old_sha) = meta.sha_history.pop() {
                         let key = InodeMetadata::cloud_key_for_sha(old_sha, &meta.filename);
@@ -390,6 +451,51 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         Ok(stat.blocks_available() * stat.block_size() as u64)
     }
 
+    /// Process pending purge entries from the log
+    async fn process_pending_purges(&self) -> Result<()> {
+        // Read all log records and collect Purge entries
+        let purge_keys: Vec<(String, u64)> = {
+            let _log = self.log.read().unwrap();
+            let log_path = self.config.log_path();
+
+            match MetadataLog::read_all(&log_path) {
+                Ok(records) => records
+                    .into_iter()
+                    .filter_map(|r| {
+                        if let crate::metadata::LogRecord::Purge { key, inode, .. } = r {
+                            Some((key, inode))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("Failed to read log for pending purges: {}", e);
+                    Vec::new()
+                }
+            }
+        };
+
+        if purge_keys.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!("Processing {} pending purge(s) from log", purge_keys.len());
+
+        for (key, inode) in purge_keys {
+            match self.cloud.delete_by_key(&key).await {
+                Ok(()) => {
+                    tracing::debug!("Purged old version for inode {}: {}", inode, key);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to purge {} for inode {}: {}", key, inode, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Save checkpoint to disk and truncate the log
     fn save_checkpoint(&self) -> Result<()> {
         let cp = self.checkpoint.read().unwrap();
@@ -437,6 +543,7 @@ mod tests {
             version_count: 3,
             inconsistent_start: false,
             max_storage: 0,
+            parallel_upload: 8,
         }
     }
 

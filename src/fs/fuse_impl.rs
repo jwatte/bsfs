@@ -14,6 +14,7 @@ use crate::cloud::CloudStorage;
 use crate::config::Config;
 use crate::fs::operations;
 use crate::metadata::{Checkpoint, FileType, InodeMetadata, LogRecord, MetadataLog};
+use crate::upload_manager::{UploadRequest, UploadSender};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -35,6 +36,7 @@ pub struct BsfsFilesystem<C: CloudStorage> {
     runtime: Handle,
     open_files: RwLock<HashMap<u64, OpenFile>>,
     next_fh: RwLock<u64>,
+    upload_tx: UploadSender,
 }
 
 impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
@@ -45,6 +47,7 @@ impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
         log: Arc<RwLock<MetadataLog>>,
         cloud: Arc<C>,
         runtime: Handle,
+        upload_tx: UploadSender,
     ) -> Self {
         Self {
             config,
@@ -55,6 +58,7 @@ impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
             runtime,
             open_files: RwLock::new(HashMap::new()),
             next_fh: RwLock::new(1),
+            upload_tx,
         }
     }
 
@@ -176,8 +180,8 @@ impl<C: CloudStorage + 'static> Filesystem for BsfsFilesystem<C> {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -215,10 +219,36 @@ impl<C: CloudStorage + 'static> Filesystem for BsfsFilesystem<C> {
                     return;
                 }
                 meta.size = s;
+                // Size change is a content modification
+                meta.unix_mtime = now;
             }
         }
 
+        // Handle user-requested atime update
+        if let Some(atime_val) = atime {
+            meta.unix_atime = match atime_val {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => now,
+            };
+        }
+
+        // Handle user-requested mtime update
+        // When a user sets mtime (e.g., via touch or archive tools), we:
+        // 1. Set the Unix-level mtime to their requested value
+        // 2. Mark our internal mutated_time to "now" because we observed a change
+        if let Some(mtime_val) = mtime {
+            meta.unix_mtime = match mtime_val {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => now,
+            };
+            // Internal bookkeeping: we observed a metadata change now
+            meta.mutated_time = now;
+        }
+
+        // Any metadata change updates our internal mutated_time and Unix ctime
         meta.mutated_time = now;
+        meta.unix_ctime = now;
+
         let attr = meta.to_file_attr();
 
         // Log the change
@@ -555,12 +585,13 @@ impl<C: CloudStorage + 'static> Filesystem for BsfsFilesystem<C> {
             );
         }
 
-        // Update accessed time and log
+        // Update accessed time (both internal and Unix-level) and log
         let now = self.clock.now();
         {
             let mut cp = self.checkpoint.write().unwrap();
             if let Some(meta) = cp.get_mut(ino) {
                 meta.accessed_time = now;
+                meta.unix_atime = now;
             }
         }
 
@@ -605,15 +636,23 @@ impl<C: CloudStorage + 'static> Filesystem for BsfsFilesystem<C> {
             (None, size)
         };
 
-        // Update metadata
+        // Update metadata (both internal bookkeeping and Unix-level timestamps)
         {
             let mut cp = self.checkpoint.write().unwrap();
             if let Some(meta) = cp.get_mut(ino) {
+                // Internal bookkeeping timestamps
                 meta.accessed_time = now;
                 meta.closed_time = now;
+
+                // Unix-level timestamps
+                meta.unix_atime = now;
+
                 if was_written {
                     meta.mutated_time = now;
                     meta.size = new_size;
+                    // Update Unix mtime and ctime on write
+                    meta.unix_mtime = now;
+                    meta.unix_ctime = now;
                 }
             }
         }
@@ -627,6 +666,13 @@ impl<C: CloudStorage + 'static> Filesystem for BsfsFilesystem<C> {
                 new_sha256,
                 new_size,
             });
+        }
+
+        // Queue for background upload if file was written
+        if was_written {
+            if let Err(e) = self.upload_tx.send(UploadRequest { inode: ino }) {
+                tracing::warn!("Failed to queue upload for inode {}: {}", ino, e);
+            }
         }
 
         reply.ok();
@@ -803,7 +849,10 @@ impl<C: CloudStorage + 'static> Filesystem for BsfsFilesystem<C> {
         if let Some(meta) = cp.get_mut(inode) {
             meta.parent = newparent;
             meta.filename = newname.to_string();
+            // Internal bookkeeping: metadata changed
             meta.mutated_time = now;
+            // Unix ctime: metadata changed
+            meta.unix_ctime = now;
         }
 
         drop(cp);

@@ -74,6 +74,7 @@ fn find_future_timestamps(
     let mut results = Vec::new();
 
     for meta in checkpoint.inodes.values() {
+        // Check internal bookkeeping timestamps
         if meta.created_time > now {
             results.push((meta.inode, "created_time", meta.created_time));
         }
@@ -85,6 +86,16 @@ fn find_future_timestamps(
         }
         if meta.closed_time > now {
             results.push((meta.inode, "closed_time", meta.closed_time));
+        }
+        // Check Unix-level timestamps
+        if meta.unix_atime > now {
+            results.push((meta.inode, "unix_atime", meta.unix_atime));
+        }
+        if meta.unix_mtime > now {
+            results.push((meta.inode, "unix_mtime", meta.unix_mtime));
+        }
+        if meta.unix_ctime > now {
+            results.push((meta.inode, "unix_ctime", meta.unix_ctime));
         }
         if let Some(cp_time) = meta.checkpointed_time {
             if cp_time > now {
@@ -99,7 +110,7 @@ fn find_future_timestamps(
 /// Adjust timestamps so the latest is `now` and others are moved back proportionally
 fn adjust_timestamps(checkpoint: &mut Checkpoint, now: SystemTime) -> Result<()> {
     for meta in checkpoint.inodes.values_mut() {
-        // Find the latest timestamp
+        // Find the latest timestamp (check both internal and Unix timestamps)
         let mut latest = meta.created_time;
         if meta.mutated_time > latest {
             latest = meta.mutated_time;
@@ -109,6 +120,15 @@ fn adjust_timestamps(checkpoint: &mut Checkpoint, now: SystemTime) -> Result<()>
         }
         if meta.closed_time > latest {
             latest = meta.closed_time;
+        }
+        if meta.unix_atime > latest {
+            latest = meta.unix_atime;
+        }
+        if meta.unix_mtime > latest {
+            latest = meta.unix_mtime;
+        }
+        if meta.unix_ctime > latest {
+            latest = meta.unix_ctime;
         }
         if let Some(cp_time) = meta.checkpointed_time {
             if cp_time > latest {
@@ -120,10 +140,16 @@ fn adjust_timestamps(checkpoint: &mut Checkpoint, now: SystemTime) -> Result<()>
         if latest > now {
             let delta = latest.duration_since(now).unwrap_or(Duration::ZERO);
 
+            // Adjust internal bookkeeping timestamps
             meta.created_time = meta.created_time.checked_sub(delta).unwrap_or(now);
             meta.mutated_time = meta.mutated_time.checked_sub(delta).unwrap_or(now);
             meta.accessed_time = meta.accessed_time.checked_sub(delta).unwrap_or(now);
             meta.closed_time = meta.closed_time.checked_sub(delta).unwrap_or(now);
+
+            // Adjust Unix-level timestamps
+            meta.unix_atime = meta.unix_atime.checked_sub(delta).unwrap_or(now);
+            meta.unix_mtime = meta.unix_mtime.checked_sub(delta).unwrap_or(now);
+            meta.unix_ctime = meta.unix_ctime.checked_sub(delta).unwrap_or(now);
 
             if let Some(cp_time) = meta.checkpointed_time {
                 meta.checkpointed_time = Some(cp_time.checked_sub(delta).unwrap_or(now));

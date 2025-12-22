@@ -11,13 +11,6 @@ ExecStop=/bin/fusermount -u /mnt/bsfs
 Restart=on-failure
 RestartSec=5
 
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=true
-ReadWritePaths=/mnt/bsfs /mnt/data/storage
-
 # Allow FUSE operations
 CapabilityBoundingSet=CAP_SYS_ADMIN
 AmbientCapabilities=CAP_SYS_ADMIN

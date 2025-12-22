@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -7,9 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::error::{BsfsError, Result};
-use crate::metadata::Checkpoint;
+use crate::metadata::{Checkpoint, INODE_FIXED_SIZE};
 
+const LOG_FILE_MAGIC: &[u8; 8] = b"BSFS_LG\0";
+const LOG_VERSION: u32 = 1;
 const LOG_RECORD_MAGIC: u32 = 0x4C4F4752; // "LOGR"
+const LOG_HEADER_SIZE: u64 = 8 + 4 + 4; // magic + version + inode_fixed_size
 
 /// A single record in the metadata log
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +64,14 @@ pub enum LogRecord {
         size: Option<u64>,
         timestamp: SystemTime,
     },
+    /// Old version should be purged from cloud storage
+    Purge {
+        /// Cloud storage key to delete
+        key: String,
+        /// Inode this version belonged to (for logging)
+        inode: u64,
+        timestamp: SystemTime,
+    },
 }
 
 impl LogRecord {
@@ -80,18 +91,77 @@ pub struct MetadataLog {
 }
 
 impl MetadataLog {
+    /// Write the file header
+    fn write_header(writer: &mut BufWriter<File>) -> Result<()> {
+        writer.write_all(LOG_FILE_MAGIC)?;
+        writer.write_all(&LOG_VERSION.to_le_bytes())?;
+        writer.write_all(&INODE_FIXED_SIZE.to_le_bytes())?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Verify the file header, returns Ok(()) if valid
+    fn verify_header(path: &Path) -> Result<()> {
+        let mut file = File::open(path)?;
+
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)?;
+        if &magic != LOG_FILE_MAGIC {
+            return Err(BsfsError::Recovery("Invalid log file magic".into()));
+        }
+
+        let mut version_bytes = [0u8; 4];
+        file.read_exact(&mut version_bytes)?;
+        let version = u32::from_le_bytes(version_bytes);
+        if version != LOG_VERSION {
+            return Err(BsfsError::Recovery(format!(
+                "Unsupported log version: {} (expected {})",
+                version, LOG_VERSION
+            )));
+        }
+
+        let mut inode_size_bytes = [0u8; 4];
+        file.read_exact(&mut inode_size_bytes)?;
+        let inode_fixed_size = u32::from_le_bytes(inode_size_bytes);
+        if inode_fixed_size != INODE_FIXED_SIZE {
+            return Err(BsfsError::Recovery(format!(
+                "Incompatible inode format in log: file has fixed_size={}, expected {}",
+                inode_fixed_size, INODE_FIXED_SIZE
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Open or create the metadata log
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let writer = BufWriter::new(file);
+        let needs_header = !path.exists() || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            writer: Some(writer),
-        })
+        if needs_header {
+            // Create new file with header
+            let file = File::create(path)?;
+            let mut writer = BufWriter::new(file);
+            Self::write_header(&mut writer)?;
+
+            Ok(Self {
+                path: path.to_path_buf(),
+                writer: Some(writer),
+            })
+        } else {
+            // Verify existing header
+            Self::verify_header(path)?;
+
+            // Open for appending
+            let file = OpenOptions::new()
+                .append(true)
+                .open(path)?;
+            let writer = BufWriter::new(file);
+
+            Ok(Self {
+                path: path.to_path_buf(),
+                writer: Some(writer),
+            })
+        }
     }
 
     /// Append a record to the log
@@ -122,8 +192,20 @@ impl MetadataLog {
             return Ok(Vec::new());
         }
 
+        let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if file_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Verify header first
+        Self::verify_header(path)?;
+
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
+
+        // Skip past the header
+        reader.seek(SeekFrom::Start(LOG_HEADER_SIZE))?;
+
         let mut records = Vec::new();
 
         loop {
@@ -293,30 +375,27 @@ impl MetadataLog {
                         meta.mutated_time = *timestamp;
                     }
                 }
+                LogRecord::Purge { .. } => {
+                    // Purge records don't modify checkpoint state
+                    // They're processed by the sweeper for cloud storage cleanup
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Truncate the log file
+    /// Truncate the log file (keeps header, removes all records)
     pub fn truncate(&mut self) -> Result<()> {
         // Close current writer
         self.writer = None;
 
-        // Truncate file
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        drop(file);
+        // Truncate file and rewrite header
+        let file = File::create(&self.path)?;
+        let mut writer = BufWriter::new(file);
+        Self::write_header(&mut writer)?;
 
-        // Reopen for appending
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = Some(BufWriter::new(file));
+        self.writer = Some(writer);
 
         Ok(())
     }
@@ -490,6 +569,7 @@ mod proptest_tests {
             LogRecord::Delete { timestamp, .. } => *timestamp,
             LogRecord::Rename { timestamp, .. } => *timestamp,
             LogRecord::SetAttr { timestamp, .. } => *timestamp,
+            LogRecord::Purge { timestamp, .. } => *timestamp,
         }
     }
 

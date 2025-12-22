@@ -3,6 +3,23 @@ use std::time::SystemTime;
 
 use crate::clock::Clock;
 
+/// Minimum serialized size of InodeMetadata when all variable-length fields are empty.
+/// This is used as a compatibility marker in file headers.
+///
+/// Bincode serialization sizes:
+///   inode: u64 (8) + filename: String empty (8) + parent: u64 (8) +
+///   file_type: u32 (4) + permissions: u16 (2) + uid: u32 (4) + gid: u32 (4) + size: u64 (8) +
+///   created_time (12) + mutated_time (12) + accessed_time (12) + closed_time (12) +
+///   unix_atime (12) + unix_mtime (12) + unix_ctime (12) +
+///   checkpointed_time: Option None (1) + checkpointed_sha256: Option None (1) +
+///   sha_history: Vec empty (8) + local_data_present: bool (1) + children: Vec empty (8)
+///
+/// Note: SystemTime is serialized by bincode as (secs: u64, nanos: u32) = 12 bytes
+/// Note: Empty String/Vec has 8-byte length prefix, Option None is 1 byte
+///
+/// If this value doesn't match the actual serialized size, see test_inode_fixed_size_matches_serialized
+pub const INODE_FIXED_SIZE: u32 = 149;
+
 /// File type for an inode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileType {
@@ -47,17 +64,39 @@ pub struct InodeMetadata {
     /// File size in bytes (for regular files)
     pub size: u64,
 
-    /// Time the file was created
+    // === Internal bookkeeping timestamps ===
+    // These are used for archival/eviction decisions and are not user-visible.
+    // They track when the filesystem actually observed changes.
+
+    /// Time the file was created (internal)
     pub created_time: SystemTime,
 
-    /// Time the file content was last modified (on close if written)
+    /// Time the file content was last modified (internal, on close if written)
+    /// This is updated even when user sets mtime to an old value.
     pub mutated_time: SystemTime,
 
-    /// Time the file was last accessed (on open and close)
+    /// Time the file was last accessed (internal, on open and close)
+    /// Used for cold storage eviction decisions.
     pub accessed_time: SystemTime,
 
-    /// Time the file was last closed
+    /// Time the file was last closed (internal)
     pub closed_time: SystemTime,
+
+    // === Unix-level timestamps ===
+    // These are what stat() returns and what users can modify via utimes/utimensat.
+
+    /// Unix atime - last access time (user-visible, can be set by user)
+    #[serde(default = "default_unix_time")]
+    pub unix_atime: SystemTime,
+
+    /// Unix mtime - last modification time (user-visible, can be set by user)
+    #[serde(default = "default_unix_time")]
+    pub unix_mtime: SystemTime,
+
+    /// Unix ctime - last status change time (user-visible, updated on metadata changes)
+    /// Note: ctime cannot be set by users, only updated by the kernel on metadata changes.
+    #[serde(default = "default_unix_time")]
+    pub unix_ctime: SystemTime,
 
     /// Time the file was last checkpointed to cloud storage (None if never)
     pub checkpointed_time: Option<SystemTime>,
@@ -82,6 +121,10 @@ pub struct InodeMetadata {
     pub crc: u32,
 }
 
+fn default_unix_time() -> SystemTime {
+    SystemTime::UNIX_EPOCH
+}
+
 impl InodeMetadata {
     /// Create a new root directory inode
     pub fn new_root(clock: &dyn Clock, uid: u32, gid: u32) -> Self {
@@ -99,6 +142,9 @@ impl InodeMetadata {
             mutated_time: now,
             accessed_time: now,
             closed_time: now,
+            unix_atime: now,
+            unix_mtime: now,
+            unix_ctime: now,
             checkpointed_time: None,
             checkpointed_sha256: None,
             sha_history: Vec::new(),
@@ -124,6 +170,9 @@ impl InodeMetadata {
             mutated_time: now,
             accessed_time: now,
             closed_time: now,
+            unix_atime: now,
+            unix_mtime: now,
+            unix_ctime: now,
             checkpointed_time: None,
             checkpointed_sha256: None,
             sha_history: Vec::new(),
@@ -149,6 +198,9 @@ impl InodeMetadata {
             mutated_time: now,
             accessed_time: now,
             closed_time: now,
+            unix_atime: now,
+            unix_mtime: now,
+            unix_ctime: now,
             checkpointed_time: None,
             checkpointed_sha256: None,
             sha_history: Vec::new(),
@@ -238,6 +290,7 @@ impl InodeMetadata {
     }
 
     /// Convert to fuser FileAttr
+    /// Uses the Unix-level timestamps (user-visible) rather than internal bookkeeping times
     pub fn to_file_attr(&self) -> fuser::FileAttr {
         let kind = match self.file_type {
             FileType::RegularFile => fuser::FileType::RegularFile,
@@ -248,9 +301,9 @@ impl InodeMetadata {
             ino: self.inode,
             size: self.size,
             blocks: (self.size + 511) / 512,
-            atime: self.accessed_time,
-            mtime: self.mutated_time,
-            ctime: self.mutated_time,
+            atime: self.unix_atime,
+            mtime: self.unix_mtime,
+            ctime: self.unix_ctime,
             crtime: self.created_time,
             kind,
             perm: self.permissions,
@@ -272,6 +325,47 @@ impl InodeMetadata {
 mod tests {
     use super::*;
     use crate::clock::MockClock;
+
+    #[test]
+    fn test_inode_fixed_size_matches_serialized() {
+        // Create an inode with all variable-length fields empty/None
+        // This tests that INODE_FIXED_SIZE is correct and will catch
+        // any new fields that are added without updating the constant.
+        let clock = MockClock::default();
+        let inode = InodeMetadata {
+            inode: 0,
+            filename: String::new(),  // empty
+            parent: 0,
+            file_type: FileType::RegularFile,
+            permissions: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            created_time: clock.now(),
+            mutated_time: clock.now(),
+            accessed_time: clock.now(),
+            closed_time: clock.now(),
+            unix_atime: clock.now(),
+            unix_mtime: clock.now(),
+            unix_ctime: clock.now(),
+            checkpointed_time: None,  // None
+            checkpointed_sha256: None,  // None
+            sha_history: Vec::new(),  // empty
+            local_data_present: false,
+            children: Vec::new(),  // empty
+            crc: 0,
+        };
+
+        let bytes = inode.to_bytes().unwrap();
+        assert_eq!(
+            bytes.len() as u32,
+            INODE_FIXED_SIZE,
+            "INODE_FIXED_SIZE ({}) doesn't match actual serialized size of minimal inode ({}). \
+             Did you add a new field and forget to update INODE_FIXED_SIZE?",
+            INODE_FIXED_SIZE,
+            bytes.len()
+        );
+    }
 
     #[test]
     fn test_new_root() {
@@ -359,6 +453,9 @@ mod proptest_tests {
             mutated_time in arb_timestamp(),
             accessed_time in arb_timestamp(),
             closed_time in arb_timestamp(),
+            unix_atime in arb_timestamp(),
+            unix_mtime in arb_timestamp(),
+            unix_ctime in arb_timestamp(),
         ) -> InodeMetadata {
             InodeMetadata {
                 inode,
@@ -373,6 +470,9 @@ mod proptest_tests {
                 mutated_time,
                 accessed_time,
                 closed_time,
+                unix_atime,
+                unix_mtime,
+                unix_ctime,
                 checkpointed_time: None,
                 checkpointed_sha256: None,
                 sha_history: Vec::new(),
@@ -392,11 +492,15 @@ mod proptest_tests {
             prop_assert_eq!(restored.filename, metadata.filename);
             prop_assert_eq!(restored.parent, metadata.parent);
             prop_assert_eq!(restored.permissions, metadata.permissions);
-            // Now we can compare timestamps!
+            // Internal bookkeeping timestamps
             prop_assert_eq!(restored.created_time, metadata.created_time);
             prop_assert_eq!(restored.mutated_time, metadata.mutated_time);
             prop_assert_eq!(restored.accessed_time, metadata.accessed_time);
             prop_assert_eq!(restored.closed_time, metadata.closed_time);
+            // Unix-level timestamps
+            prop_assert_eq!(restored.unix_atime, metadata.unix_atime);
+            prop_assert_eq!(restored.unix_mtime, metadata.unix_mtime);
+            prop_assert_eq!(restored.unix_ctime, metadata.unix_ctime);
         }
 
         #[test]

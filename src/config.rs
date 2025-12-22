@@ -35,6 +35,10 @@ pub struct Config {
     /// Maximum storage capacity in bytes (0 = use underlying physical storage)
     #[serde(default)]
     pub max_storage: u64,
+
+    /// Maximum number of parallel uploads to cloud storage
+    #[serde(default = "default_parallel_upload")]
+    pub parallel_upload: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -61,6 +65,10 @@ fn default_version_count() -> u32 {
     5
 }
 
+fn default_parallel_upload() -> u32 {
+    8
+}
+
 impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -83,6 +91,11 @@ impl Config {
         if self.sweep_interval_secs == 0 {
             return Err(BsfsError::Config(
                 "sweep_interval_secs must be at least 1".into(),
+            ));
+        }
+        if self.parallel_upload == 0 {
+            return Err(BsfsError::Config(
+                "parallel_upload must be at least 1".into(),
             ));
         }
 
@@ -140,6 +153,7 @@ mod tests {
         assert_eq!(config.version_count, 5);
         assert!(!config.inconsistent_start);
         assert_eq!(config.max_storage, 0);
+        assert_eq!(config.parallel_upload, 8);
     }
 
     #[test]
@@ -186,6 +200,28 @@ mod tests {
         }"#;
         let result = Config::from_json(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zero_parallel_upload_fails() {
+        let json = r#"{
+            "local_root": "/tmp/bsfs",
+            "gcs_bucket": "bucket",
+            "parallel_upload": 0
+        }"#;
+        let result = Config::from_json(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_custom_parallel_upload() {
+        let json = r#"{
+            "local_root": "/tmp/bsfs",
+            "gcs_bucket": "bucket",
+            "parallel_upload": 16
+        }"#;
+        let config = Config::from_json(json).unwrap();
+        assert_eq!(config.parallel_upload, 16);
     }
 
     #[test]

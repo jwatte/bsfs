@@ -5,10 +5,10 @@ use std::path::Path;
 
 use crate::clock::Clock;
 use crate::error::{BsfsError, Result};
-use crate::metadata::InodeMetadata;
+use crate::metadata::{InodeMetadata, INODE_FIXED_SIZE};
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"BSFS_CP\0";
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2; // Bumped for inode_fixed_size field
 
 /// Manages the checkpoint file containing full filesystem state
 pub struct Checkpoint {
@@ -50,8 +50,19 @@ impl Checkpoint {
         let version = u32::from_le_bytes(version_bytes);
         if version != CHECKPOINT_VERSION {
             return Err(BsfsError::Recovery(format!(
-                "Unsupported checkpoint version: {}",
-                version
+                "Unsupported checkpoint version: {} (expected {})",
+                version, CHECKPOINT_VERSION
+            )));
+        }
+
+        // Read and verify inode_fixed_size
+        let mut inode_size_bytes = [0u8; 4];
+        reader.read_exact(&mut inode_size_bytes)?;
+        let inode_fixed_size = u32::from_le_bytes(inode_size_bytes);
+        if inode_fixed_size != INODE_FIXED_SIZE {
+            return Err(BsfsError::Recovery(format!(
+                "Incompatible inode format: file has fixed_size={}, expected {}",
+                inode_fixed_size, INODE_FIXED_SIZE
             )));
         }
 
@@ -102,6 +113,9 @@ impl Checkpoint {
 
             // Write version
             writer.write_all(&CHECKPOINT_VERSION.to_le_bytes())?;
+
+            // Write inode_fixed_size for compatibility checking
+            writer.write_all(&INODE_FIXED_SIZE.to_le_bytes())?;
 
             // Write next_inode
             writer.write_all(&self.next_inode.to_le_bytes())?;
