@@ -197,6 +197,18 @@ The background sweeper runs at `sweep_interval_secs` intervals and:
 4. **Checkpoint persistence**: After any changes, saves the checkpoint to disk
    and uploads it to cloud storage.
 
+### On-Demand Space Reclamation
+
+When a program tries to create a new file and free space is below `target_free_space`:
+
+1. The `create()` call triggers an immediate on-demand sweep
+2. The sweep targets 150% of `target_free_space` to provide headroom
+3. The `create()` blocks until the sweep completes
+4. If sufficient space cannot be freed (no evictable files), returns `ENOSPC`
+
+This ensures that file creation only fails when space genuinely cannot be reclaimed,
+while avoiding unnecessary blocking when space is available.
+
 ### Recovery
 
 On startup, BSFS:

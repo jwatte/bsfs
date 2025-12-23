@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::interval;
 
 use crate::clock::SharedClock;
@@ -10,6 +10,28 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::fs::operations;
 use crate::metadata::{Checkpoint, FileType, InodeMetadata, MetadataLog};
+
+/// Request to trigger an immediate sweep with a specific free space target
+#[derive(Debug)]
+pub struct SweepRequest {
+    /// Target free space to achieve (may be higher than config default)
+    pub target_free_space: u64,
+    /// Channel to send response when sweep completes
+    pub response_tx: oneshot::Sender<SweepResponse>,
+}
+
+/// Response from a sweep request
+#[derive(Debug)]
+pub struct SweepResponse {
+    /// Current free space after the sweep
+    pub free_space: u64,
+    /// Whether the target was achieved
+    #[allow(dead_code)]
+    pub target_achieved: bool,
+}
+
+/// Sender for triggering on-demand sweeps
+pub type SweepSender = mpsc::UnboundedSender<SweepRequest>;
 
 /// Entry indicating a SHA should be purged from cold storage
 #[derive(Debug, Clone)]
@@ -29,6 +51,8 @@ pub struct Sweeper<C: CloudStorage> {
     checkpoint: Arc<RwLock<Checkpoint>>,
     log: Arc<RwLock<MetadataLog>>,
     cloud: Arc<C>,
+    /// Receiver for on-demand sweep requests
+    sweep_rx: mpsc::UnboundedReceiver<SweepRequest>,
     /// Override free space for testing (None = use real statvfs)
     #[cfg(test)]
     free_space_override: std::sync::Mutex<Option<u64>>,
@@ -41,16 +65,21 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         checkpoint: Arc<RwLock<Checkpoint>>,
         log: Arc<RwLock<MetadataLog>>,
         cloud: Arc<C>,
-    ) -> Self {
-        Self {
+    ) -> (Self, SweepSender) {
+        let (sweep_tx, sweep_rx) = mpsc::unbounded_channel();
+
+        let sweeper = Self {
             config,
             clock,
             checkpoint,
             log,
             cloud,
+            sweep_rx,
             #[cfg(test)]
             free_space_override: std::sync::Mutex::new(None),
-        }
+        };
+
+        (sweeper, sweep_tx)
     }
 
     /// Set the free space value for testing
@@ -60,24 +89,49 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
     }
 
     /// Run the sweeper loop
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         let mut interval = interval(Duration::from_secs(self.config.sweep_interval_secs));
 
         loop {
-            interval.tick().await;
-            if let Err(e) = self.sweep().await {
-                tracing::error!("Sweeper error: {}", e);
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Regular periodic sweep
+                    if let Err(e) = self.sweep_with_target(self.config.target_free_space).await {
+                        tracing::error!("Sweeper error: {}", e);
+                    }
+                }
+                Some(request) = self.sweep_rx.recv() => {
+                    // On-demand sweep request (e.g., from create() when space is low)
+                    tracing::info!(
+                        "On-demand sweep requested with target {} bytes",
+                        request.target_free_space
+                    );
+
+                    let result = self.sweep_with_target(request.target_free_space).await;
+                    let free_space = self.get_free_space().unwrap_or(0);
+                    let target_achieved = free_space >= request.target_free_space;
+
+                    // Send response (ignore error if receiver dropped)
+                    let _ = request.response_tx.send(SweepResponse {
+                        free_space,
+                        target_achieved,
+                    });
+
+                    if let Err(e) = result {
+                        tracing::error!("On-demand sweep error: {}", e);
+                    }
+                }
             }
         }
     }
 
-    /// Perform a single sweep cycle:
+    /// Perform a single sweep cycle with a specific free space target:
     /// 1. Checkpoint any modified files to cloud (proactive backup)
     /// 2. Purge old versions from cold storage
     /// 3. If low on disk space, evict cold files that are safely checkpointed
     /// 4. Save checkpoint to disk and upload to cloud (only if changes were made)
-    async fn sweep(&self) -> Result<()> {
-        tracing::debug!("Starting sweep");
+    async fn sweep_with_target(&self, target_free_space: u64) -> Result<()> {
+        tracing::debug!("Starting sweep with target {} bytes", target_free_space);
 
         let mut checkpoint_changed = false;
         let mut purge_entries: Vec<PurgeEntry> = Vec::new();
@@ -100,13 +154,13 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
 
         // Phase 3: Evict local data only if we're low on space
         let free_space = self.get_free_space()?;
-        if free_space < self.config.target_free_space {
+        if free_space < target_free_space {
             tracing::info!(
                 "Free space {} below target {}, evicting cold files",
                 free_space,
-                self.config.target_free_space
+                target_free_space
             );
-            if self.evict_cold_files().await? {
+            if self.evict_cold_files_to_target(target_free_space).await? {
                 checkpoint_changed = true;
             }
         } else {
@@ -120,6 +174,12 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         }
 
         Ok(())
+    }
+
+    /// Perform a sweep with the default target from config
+    #[cfg(test)]
+    async fn sweep(&self) -> Result<()> {
+        self.sweep_with_target(self.config.target_free_space).await
     }
 
     /// Purge old versions from cold storage
@@ -360,15 +420,15 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
     /// Evict cold files from local storage to free up disk space
     /// Only evicts files that are safely checkpointed to cloud
     /// Returns true if any files were evicted
-    async fn evict_cold_files(&self) -> Result<bool> {
+    async fn evict_cold_files_to_target(&self, target_free_space: u64) -> Result<bool> {
         let data_root = self.config.data_root();
         let mut evicted_any = false;
 
         loop {
             // Check if we have enough space now
             let free_space = self.get_free_space()?;
-            if free_space >= self.config.target_free_space {
-                tracing::info!("Target free space reached");
+            if free_space >= target_free_space {
+                tracing::info!("Target free space {} reached (have {})", target_free_space, free_space);
                 break;
             }
 
@@ -403,6 +463,12 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
         }
 
         Ok(evicted_any)
+    }
+
+    /// Evict cold files using the default target from config (for tests)
+    #[cfg(test)]
+    async fn evict_cold_files(&self) -> Result<bool> {
+        self.evict_cold_files_to_target(self.config.target_free_space).await
     }
 
     /// Find the next cold file that can be safely evicted
@@ -557,13 +623,14 @@ mod tests {
         let log = Arc::new(RwLock::new(MetadataLog::open(&log_path).unwrap()));
         let cloud = Arc::new(MockCloudStorage::new());
 
-        Sweeper::new(
+        let (sweeper, _sweep_tx) = Sweeper::new(
             config,
             clock.clone() as SharedClock,
             checkpoint,
             log,
             cloud,
-        )
+        );
+        sweeper
     }
 
     #[test]

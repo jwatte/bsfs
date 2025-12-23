@@ -368,25 +368,26 @@ async fn main() -> anyhow::Result<()> {
     );
     let upload_handle = tokio::spawn(upload_manager.run());
 
-    let filesystem = fs::BsfsFilesystem::new(
+    // Create sweeper (need sweep_tx for filesystem)
+    let (sweeper, sweep_tx) = sweeper::Sweeper::new(
         config.clone(),
         clock.clone(),
         checkpoint.clone(),
         log.clone(),
         cloud.clone(),
-        runtime.clone(),
-        upload_tx,
     );
+    let sweeper_handle = tokio::spawn(sweeper.run());
 
-    // Start sweeper task (handles eviction, version purging, and checkpoint persistence)
-    let sweeper = sweeper::Sweeper::new(
+    let filesystem = fs::BsfsFilesystem::new(
         config.clone(),
         clock,
         checkpoint,
         log,
         cloud,
+        runtime.clone(),
+        upload_tx,
+        sweep_tx,
     );
-    let sweeper_handle = tokio::spawn(sweeper.run());
 
     // Mount options
     let options = vec![

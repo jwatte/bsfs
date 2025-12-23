@@ -14,6 +14,7 @@ use crate::cloud::CloudStorage;
 use crate::config::Config;
 use crate::fs::operations;
 use crate::metadata::{Checkpoint, FileType, InodeMetadata, LogRecord, MetadataLog};
+use crate::sweeper::{SweepRequest, SweepSender};
 use crate::upload_manager::{UploadRequest, UploadSender};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -37,6 +38,7 @@ pub struct BsfsFilesystem<C: CloudStorage> {
     open_files: RwLock<HashMap<u64, OpenFile>>,
     next_fh: RwLock<u64>,
     upload_tx: UploadSender,
+    sweep_tx: SweepSender,
 }
 
 impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
@@ -48,6 +50,7 @@ impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
         cloud: Arc<C>,
         runtime: Handle,
         upload_tx: UploadSender,
+        sweep_tx: SweepSender,
     ) -> Self {
         Self {
             config,
@@ -59,6 +62,7 @@ impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
             open_files: RwLock::new(HashMap::new()),
             next_fh: RwLock::new(1),
             upload_tx,
+            sweep_tx,
         }
     }
 
@@ -67,6 +71,72 @@ impl<C: CloudStorage + 'static> BsfsFilesystem<C> {
         let result = *fh;
         *fh += 1;
         result
+    }
+
+    /// Get free space on the local filesystem
+    fn get_free_space(&self) -> std::io::Result<u64> {
+        let stat = nix::sys::statvfs::statvfs(&self.config.local_root)?;
+        Ok(stat.blocks_available() * stat.block_size() as u64)
+    }
+
+    /// Ensure sufficient free space before creating a file.
+    /// If space is low, triggers an on-demand sweep with 1.5x target.
+    /// Returns Ok(()) if space is available, Err with errno if not.
+    fn ensure_space_for_create(&self) -> std::result::Result<(), i32> {
+        let free_space = match self.get_free_space() {
+            Ok(s) => s,
+            Err(_) => return Ok(()), // If we can't check, proceed anyway
+        };
+
+        let target = self.config.target_free_space;
+        if free_space >= target {
+            return Ok(());
+        }
+
+        // Space is low - request an on-demand sweep with 1.5x target
+        let enhanced_target = target + target / 2; // 150% of target
+        tracing::warn!(
+            "Free space {} below target {}, requesting on-demand sweep to {} bytes",
+            free_space,
+            target,
+            enhanced_target
+        );
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let request = SweepRequest {
+            target_free_space: enhanced_target,
+            response_tx,
+        };
+
+        if self.sweep_tx.send(request).is_err() {
+            tracing::error!("Failed to send sweep request - sweeper may be down");
+            return Err(libc::ENOSPC);
+        }
+
+        // Block waiting for the sweep to complete
+        let response = match self.runtime.block_on(response_rx) {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::error!("Sweep request channel closed");
+                return Err(libc::ENOSPC);
+            }
+        };
+
+        // Check if we achieved at least the minimum target
+        if response.free_space >= target {
+            tracing::info!(
+                "On-demand sweep complete, free space now {} bytes",
+                response.free_space
+            );
+            Ok(())
+        } else {
+            tracing::error!(
+                "Insufficient space after sweep: have {} bytes, need {} bytes",
+                response.free_space,
+                target
+            );
+            Err(libc::ENOSPC)
+        }
     }
 
     fn data_root(&self) -> PathBuf {
@@ -422,6 +492,13 @@ impl<C: CloudStorage + 'static> Filesystem for BsfsFilesystem<C> {
 
         if name.len() > 255 {
             reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        // Ensure we have enough space before creating the file
+        // This may block while the sweeper frees up space
+        if let Err(errno) = self.ensure_space_for_create() {
+            reply.error(errno);
             return;
         }
 
