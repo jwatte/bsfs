@@ -467,6 +467,7 @@ impl<C: CloudStorage + 'static> Sweeper<C> {
 
     /// Evict cold files using the default target from config (for tests)
     #[cfg(test)]
+    #[allow(dead_code)]
     async fn evict_cold_files(&self) -> Result<bool> {
         self.evict_cold_files_to_target(self.config.target_free_space).await
     }
@@ -617,20 +618,27 @@ mod tests {
         dir: &std::path::Path,
         clock: &Arc<MockClock>,
     ) -> Sweeper<MockCloudStorage> {
+        let (sweeper, _sweep_tx) = create_test_sweeper_with_sender(dir, clock);
+        sweeper
+    }
+
+    fn create_test_sweeper_with_sender(
+        dir: &std::path::Path,
+        clock: &Arc<MockClock>,
+    ) -> (Sweeper<MockCloudStorage>, SweepSender) {
         let config = create_test_config(dir);
         let checkpoint = Arc::new(RwLock::new(Checkpoint::new(clock.as_ref(), 1000, 1000)));
         let log_path = config.log_path();
         let log = Arc::new(RwLock::new(MetadataLog::open(&log_path).unwrap()));
         let cloud = Arc::new(MockCloudStorage::new());
 
-        let (sweeper, _sweep_tx) = Sweeper::new(
+        Sweeper::new(
             config,
             clock.clone() as SharedClock,
             checkpoint,
             log,
             cloud,
-        );
-        sweeper
+        )
     }
 
     #[test]
@@ -1398,5 +1406,173 @@ mod tests {
             assert_eq!(meta.sha_history[0], sha_a); // sha_a moved to front
             assert_eq!(meta.sha_history[1], sha_b); // sha_b is second
         }
+    }
+
+    #[tokio::test]
+    async fn test_on_demand_sweep_request() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (sweeper, sweep_tx) = create_test_sweeper_with_sender(dir.path(), &clock);
+
+        // Create a local file that can be evicted
+        let data_root = sweeper.config.data_root();
+        operations::create_local_file(&data_root, 2).unwrap();
+        operations::write_local(&data_root, 2, 0, b"test content").unwrap();
+
+        // Add file metadata (checkpointed and cold)
+        {
+            let mut cp = sweeper.checkpoint.write().unwrap();
+            let mut file = InodeMetadata::new_file(clock.as_ref(), 2, "test.txt".into(), 1, 1000, 1000, 0o644);
+            file.closed_time = clock.as_ref().now();
+            file.checkpointed_time = Some(clock.as_ref().now());
+            file.checkpointed_sha256 = Some([42u8; 32]);
+            file.sha_history = vec![[42u8; 32]];
+            cp.insert(file);
+        }
+
+        // Advance past cold threshold
+        clock.advance(Duration::from_secs(7200));
+
+        // Set low free space
+        sweeper.set_free_space_for_test(100); // Below 1MB target
+
+        // Start sweeper in background
+        let sweeper_handle = tokio::spawn(sweeper.run());
+
+        // Send an on-demand sweep request with 1.5x target
+        let (response_tx, response_rx) = oneshot::channel();
+        let target = 1_500_000; // 1.5MB
+        sweep_tx.send(SweepRequest {
+            target_free_space: target,
+            response_tx,
+        }).unwrap();
+
+        // Wait for response
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            response_rx
+        ).await.expect("Timeout waiting for sweep response").expect("Channel closed");
+
+        // The response should indicate the sweep completed
+        // (free space will still be low since we're using mock statvfs override)
+        assert_eq!(response.free_space, 100);
+        assert!(!response.target_achieved);
+
+        // Verify the file was evicted (since it was checkpointed and cold)
+        assert!(!operations::local_data_exists(&data_root, 2));
+
+        // Clean up
+        sweeper_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_on_demand_sweep_with_enhanced_target() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (sweeper, sweep_tx) = create_test_sweeper_with_sender(dir.path(), &clock);
+
+        // Set high free space initially
+        sweeper.set_free_space_for_test(10_000_000); // 10MB
+
+        // Start sweeper in background
+        let sweeper_handle = tokio::spawn(sweeper.run());
+
+        // Send an on-demand sweep request with target already met
+        let (response_tx, response_rx) = oneshot::channel();
+        let target = 1_500_000; // 1.5MB, already have 10MB
+        sweep_tx.send(SweepRequest {
+            target_free_space: target,
+            response_tx,
+        }).unwrap();
+
+        // Wait for response
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            response_rx
+        ).await.expect("Timeout waiting for sweep response").expect("Channel closed");
+
+        // Should report success since we have enough space
+        assert_eq!(response.free_space, 10_000_000);
+        assert!(response.target_achieved);
+
+        // Clean up
+        sweeper_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_on_demand_sweep_evicts_multiple_files() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let clock = Arc::new(MockClock::default());
+        let (sweeper, sweep_tx) = create_test_sweeper_with_sender(dir.path(), &clock);
+
+        let data_root = sweeper.config.data_root();
+        let checkpoint = sweeper.checkpoint.clone();
+
+        // Create multiple cold, checkpointed files
+        for i in 2..=5 {
+            operations::create_local_file(&data_root, i).unwrap();
+            operations::write_local(&data_root, i, 0, format!("content {}", i).as_bytes()).unwrap();
+
+            let mut cp = checkpoint.write().unwrap();
+            let mut file = InodeMetadata::new_file(
+                clock.as_ref(),
+                i,
+                format!("file{}.txt", i),
+                1,
+                1000,
+                1000,
+                0o644
+            );
+            file.closed_time = clock.as_ref().now();
+            file.checkpointed_time = Some(clock.as_ref().now());
+            file.checkpointed_sha256 = Some([i as u8; 32]);
+            file.sha_history = vec![[i as u8; 32]];
+            cp.insert(file);
+        }
+
+        // Advance past cold threshold
+        clock.advance(Duration::from_secs(7200));
+
+        // Set very low free space to trigger multiple evictions
+        sweeper.set_free_space_for_test(100);
+
+        // Start sweeper in background
+        let sweeper_handle = tokio::spawn(sweeper.run());
+
+        // Send an on-demand sweep request
+        let (response_tx, response_rx) = oneshot::channel();
+        sweep_tx.send(SweepRequest {
+            target_free_space: 2_000_000, // 2MB target
+            response_tx,
+        }).unwrap();
+
+        // Wait for response
+        let _response = tokio::time::timeout(
+            Duration::from_secs(5),
+            response_rx
+        ).await.expect("Timeout waiting for sweep response").expect("Channel closed");
+
+        // All 4 files should be evicted (but space still shows as low due to mock)
+        for i in 2..=5 {
+            assert!(
+                !operations::local_data_exists(&data_root, i),
+                "File {} should have been evicted", i
+            );
+        }
+
+        // Verify metadata shows files as not local
+        {
+            let cp = checkpoint.read().unwrap();
+            for i in 2..=5 {
+                let meta = cp.get(i).unwrap();
+                assert!(!meta.local_data_present, "File {} metadata should show not local", i);
+            }
+        }
+
+        // Clean up
+        sweeper_handle.abort();
     }
 }
