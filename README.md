@@ -2,6 +2,9 @@
 
 A userspace filesystem (FUSE) that provides transparent cloud backup with local caching.
 
+**WARNING** this is 99% vibe coded and has not stood up to any kind of torture testing.
+You almost certainly want to use Google's "gcsfuse" instead.
+
 ## Overview
 
 BSFS stores files on a local disk while automatically archiving them to Google Cloud Storage.
